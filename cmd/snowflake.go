@@ -8,11 +8,14 @@ import (
 	"github.com/pingcap-inc/tidb2dw/pkg/apiservice"
 	"github.com/pingcap-inc/tidb2dw/pkg/coreinterfaces"
 	"github.com/pingcap-inc/tidb2dw/pkg/snowsql"
+	"github.com/pingcap-inc/tidb2dw/pkg/taskstore"
+	"github.com/pingcap-inc/tidb2dw/pkg/tenant"
 	"github.com/pingcap-inc/tidb2dw/pkg/tidbsql"
 	"github.com/pingcap-inc/tidb2dw/pkg/utils"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/log"
 	"github.com/pingcap/tiflow/pkg/logutil"
+	putil "github.com/pingcap/tiflow/pkg/util"
 	"github.com/spf13/cobra"
 	"github.com/thediveo/enumflag"
 	"go.uber.org/zap"
@@ -36,9 +39,10 @@ func NewSnowflakeCmd() *cobra.Command {
 		awsSecretKey           string
 		credValue              *credentials.Value
 
-		mode          RunMode
-		apiListenHost string
-		apiListenPort int
+		mode           RunMode
+		apiListenHost  string
+		apiListenPort  int
+		tenantRegistry string
 	)
 
 	run := func() error {
@@ -48,6 +52,27 @@ func NewSnowflakeCmd() *cobra.Command {
 		})
 		if err != nil {
 			return errors.Trace(err)
+		}
+
+		if tenantRegistry != "" {
+			if mode != RunModeCloud {
+				return errors.New("--tenant-registry is only supported with --mode=cloud")
+			}
+			registry, err := tenant.LoadRegistryFile(tenantRegistry)
+			if err != nil {
+				return errors.Trace(err)
+			}
+			manager, err := tenant.NewManager(registry, taskstore.NewExternalStoreFactory(putil.GetExternalStorageFromURI))
+			if err != nil {
+				return errors.Trace(err)
+			}
+			apiservice.GlobalInstance.RegisterTenantManager(manager)
+			log.Info("Tenant-aware API registered", zap.Int("tenant-count", manager.LoadedTenantCount()))
+			return nil
+		}
+
+		if storagePath == "" {
+			return errors.New("--storage is required")
 		}
 
 		if awsAccessKey != "" && awsSecretKey != "" {
@@ -132,6 +157,7 @@ func NewSnowflakeCmd() *cobra.Command {
 	cmd.Flags().Var(enumflag.New(&mode, "mode", RunModeIds, enumflag.EnumCaseInsensitive), "mode", "replication mode: full, snapshot-only, incremental-only, cloud")
 	cmd.Flags().StringVar(&apiListenHost, "api.host", "0.0.0.0", "API service listen host, only available in --mode=cloud")
 	cmd.Flags().IntVar(&apiListenPort, "api.port", 8185, "API service listen port, only available in --mode=cloud")
+	cmd.Flags().StringVar(&tenantRegistry, "tenant-registry", "", "tenant registry JSON file for tenant-aware cloud API")
 	cmd.Flags().StringVarP(&tidbConfigFromCli.Host, "tidb.host", "h", "127.0.0.1", "TiDB host")
 	cmd.Flags().IntVarP(&tidbConfigFromCli.Port, "tidb.port", "P", 4000, "TiDB port")
 	cmd.Flags().StringVarP(&tidbConfigFromCli.User, "tidb.user", "u", "root", "TiDB user")
@@ -155,8 +181,6 @@ func NewSnowflakeCmd() *cobra.Command {
 	cmd.Flags().StringVar(&logLevel, "log.level", "info", "log level")
 	cmd.Flags().StringVar(&awsAccessKey, "aws.access-key", "", "aws access key")
 	cmd.Flags().StringVar(&awsSecretKey, "aws.secret-key", "", "aws secret key")
-
-	cmd.MarkFlagRequired("storage")
 
 	return cmd
 }

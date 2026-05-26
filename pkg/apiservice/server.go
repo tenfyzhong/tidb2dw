@@ -2,11 +2,13 @@ package apiservice
 
 import (
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 
 	"github.com/gin-gonic/gin"
+	"github.com/pingcap-inc/tidb2dw/pkg/tenant"
 	"github.com/pingcap/log"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
@@ -32,6 +34,14 @@ func New() *APIService {
 		APIInfo: apiInfo,
 		router:  r,
 	}
+}
+
+func (service *APIService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	service.router.ServeHTTP(w, r)
+}
+
+func (service *APIService) RegisterTenantManager(manager *tenant.Manager) {
+	RegisterTenantRoutes(service.router, service.APIInfo, manager)
 }
 
 // RegisterMetric registers the metric handler.

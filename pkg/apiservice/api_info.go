@@ -47,6 +47,13 @@ type InfoResponse struct {
 	TablesInfo   map[string]*TableInfo `json:"tables_info,omitempty"`
 }
 
+type ProcessInfoResponse struct {
+	Status            ServiceStatus `json:"status,omitempty"`
+	ErrorMessage      string        `json:"error_message,omitempty"`
+	LoadedTenantCount int           `json:"loaded_tenant_count"`
+	SchedulerStatus   string        `json:"scheduler_status,omitempty"`
+}
+
 type APIInfo struct {
 	r  InfoResponse
 	mu sync.Mutex
@@ -69,6 +76,22 @@ func (s *APIInfo) registerRouter(router *gin.Engine) {
 
 		c.JSON(http.StatusOK, s.r)
 	})
+}
+
+func (s *APIInfo) Snapshot() InfoResponse {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tablesInfo := make(map[string]*TableInfo, len(s.r.TablesInfo))
+	for table, info := range s.r.TablesInfo {
+		copied := *info
+		tablesInfo[table] = &copied
+	}
+	return InfoResponse{
+		Status:       s.r.Status,
+		ErrorMessage: s.r.ErrorMessage,
+		TablesInfo:   tablesInfo,
+	}
 }
 
 func (s *APIInfo) initTableInfoIfNotExist(table string) {
