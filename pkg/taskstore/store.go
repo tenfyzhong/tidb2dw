@@ -29,7 +29,7 @@ type MemoryStoreFactory struct {
 	stores map[string]*MemoryStore
 }
 
-type ExternalStorageOpener func(ctx context.Context, storageURI string) (brstorage.ExternalStorage, error)
+type ExternalStorageOpener func(ctx context.Context, tenant model.TenantConfig) (brstorage.ExternalStorage, error)
 
 type ExternalStoreFactory struct {
 	open ExternalStorageOpener
@@ -43,7 +43,7 @@ func (f *ExternalStoreFactory) NewStore(tenant model.TenantConfig) (Store, error
 	if f.open == nil {
 		return nil, fmt.Errorf("external storage opener must not be nil")
 	}
-	externalStorage, err := f.open(context.Background(), tenant.StorageURI)
+	externalStorage, err := f.open(context.Background(), tenant)
 	if err != nil {
 		return nil, err
 	}

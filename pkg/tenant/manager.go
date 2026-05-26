@@ -15,12 +15,19 @@ import (
 
 type Manager struct {
 	tenants map[string]*Context
+	runner  TaskRunner
 }
 
 type Context struct {
 	Config model.TenantConfig
 	store  taskstore.Store
 	mu     sync.Mutex
+}
+
+type TaskRunner interface {
+	ValidateTask(ctx context.Context, tenantConfig model.TenantConfig, manifest model.TaskManifest) error
+	StartTask(ctx context.Context, tenantConfig model.TenantConfig, manifest model.TaskManifest, store taskstore.Store) error
+	StopTask(ctx context.Context, tenantConfig model.TenantConfig, taskID string) error
 }
 
 type Status struct {
@@ -54,6 +61,10 @@ func NewManager(registry model.TenantRegistry, factory taskstore.Factory) (*Mana
 		}
 	}
 	return manager, nil
+}
+
+func (m *Manager) SetTaskRunner(runner TaskRunner) {
+	m.runner = runner
 }
 
 func (m *Manager) LoadedTenantCount() int {
@@ -101,11 +112,22 @@ func (m *Manager) CreateTask(ctx context.Context, tenantID string, req model.Cre
 		return model.TaskManifest{}, err
 	}
 
+	if m.runner != nil {
+		if err := m.runner.ValidateTask(ctx, tenantCtx.Config, manifest); err != nil {
+			return model.TaskManifest{}, err
+		}
+	}
+
 	tenantCtx.mu.Lock()
 	defer tenantCtx.mu.Unlock()
 
 	if err := tenantCtx.store.CreateManifest(ctx, manifest); err != nil {
 		return model.TaskManifest{}, err
+	}
+	if m.runner != nil {
+		if err := m.runner.StartTask(ctx, tenantCtx.Config, manifest, tenantCtx.store); err != nil {
+			return model.TaskManifest{}, err
+		}
 	}
 	return manifest, nil
 }
@@ -133,7 +155,83 @@ func (m *Manager) TombstoneTask(ctx context.Context, tenantID string, taskID str
 	}
 	tenantCtx.mu.Lock()
 	defer tenantCtx.mu.Unlock()
+	if m.runner != nil {
+		if err := m.runner.StopTask(ctx, tenantCtx.Config, taskID); err != nil {
+			return err
+		}
+	}
 	return tenantCtx.store.TombstoneManifest(ctx, taskID, time.Now().UTC())
+}
+
+func (m *Manager) PauseTask(ctx context.Context, tenantID string, taskID string) (model.TaskManifest, error) {
+	tenantCtx, err := m.getContext(tenantID)
+	if err != nil {
+		return model.TaskManifest{}, err
+	}
+	tenantCtx.mu.Lock()
+	defer tenantCtx.mu.Unlock()
+
+	manifest, err := tenantCtx.store.GetManifest(ctx, taskID)
+	if err != nil {
+		return model.TaskManifest{}, err
+	}
+	if m.runner != nil {
+		if err := m.runner.StopTask(ctx, tenantCtx.Config, taskID); err != nil {
+			return model.TaskManifest{}, err
+		}
+	}
+	manifest.Status = model.TaskStatusPaused
+	manifest.UpdatedAt = time.Now().UTC()
+	if err := tenantCtx.store.UpdateManifest(ctx, manifest); err != nil {
+		return model.TaskManifest{}, err
+	}
+	return manifest, nil
+}
+
+func (m *Manager) ResumeTask(ctx context.Context, tenantID string, taskID string) (model.TaskManifest, error) {
+	tenantCtx, err := m.getContext(tenantID)
+	if err != nil {
+		return model.TaskManifest{}, err
+	}
+	tenantCtx.mu.Lock()
+	defer tenantCtx.mu.Unlock()
+
+	manifest, err := tenantCtx.store.GetManifest(ctx, taskID)
+	if err != nil {
+		return model.TaskManifest{}, err
+	}
+	manifest.Status = model.TaskStatusRunning
+	manifest.UpdatedAt = time.Now().UTC()
+	if m.runner != nil {
+		if err := m.runner.StartTask(ctx, tenantCtx.Config, manifest, tenantCtx.store); err != nil {
+			return model.TaskManifest{}, err
+		}
+	}
+	if err := tenantCtx.store.UpdateManifest(ctx, manifest); err != nil {
+		return model.TaskManifest{}, err
+	}
+	return manifest, nil
+}
+
+func (m *Manager) StartLoadedTasks(ctx context.Context) error {
+	if m.runner == nil {
+		return nil
+	}
+	for _, tenantCtx := range m.tenants {
+		manifests, err := tenantCtx.store.ListManifests(ctx)
+		if err != nil {
+			return err
+		}
+		for _, manifest := range manifests {
+			if manifest.Status == model.TaskStatusPaused || manifest.Status == model.TaskStatusDeleted {
+				continue
+			}
+			if err := m.runner.StartTask(ctx, tenantCtx.Config, manifest, tenantCtx.store); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func (m *Manager) getContext(tenantID string) (*Context, error) {

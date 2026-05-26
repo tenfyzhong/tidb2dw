@@ -2,6 +2,7 @@ package tenant_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/pingcap-inc/tidb2dw/pkg/model"
@@ -107,6 +108,65 @@ func TestManagerRejectsTargetTableCollision(t *testing.T) {
 	require.ErrorContains(t, err, "target table collision")
 }
 
+func TestManagerValidatesBeforePersistingAndStartingTask(t *testing.T) {
+	ctx := context.Background()
+	manager := newTestManager(t)
+	runner := &fakeRunner{validateErr: errors.New("schema validation failed")}
+	manager.SetTaskRunner(runner)
+
+	_, err := manager.CreateTask(ctx, "tenant-a", validCreateTaskRequest())
+	require.ErrorContains(t, err, "schema validation failed")
+	require.Len(t, runner.validated, 1)
+	require.Empty(t, runner.started)
+
+	listed, listErr := manager.ListTasks(ctx, "tenant-a")
+	require.NoError(t, listErr)
+	require.Empty(t, listed)
+}
+
+func TestManagerStartsPausesAndResumesTasks(t *testing.T) {
+	ctx := context.Background()
+	manager := newTestManager(t)
+	runner := &fakeRunner{}
+	manager.SetTaskRunner(runner)
+
+	manifest, err := manager.CreateTask(ctx, "tenant-a", validCreateTaskRequest())
+	require.NoError(t, err)
+	require.Equal(t, "orders-to-snowflake", manifest.TaskID)
+	require.Len(t, runner.validated, 1)
+	require.Len(t, runner.started, 1)
+
+	_, err = manager.PauseTask(ctx, "tenant-a", "orders-to-snowflake")
+	require.NoError(t, err)
+	require.Equal(t, []string{"tenant-a/orders-to-snowflake"}, runner.stopped)
+
+	paused, err := manager.GetTask(ctx, "tenant-a", "orders-to-snowflake")
+	require.NoError(t, err)
+	require.Equal(t, model.TaskStatusPaused, paused.Status)
+
+	_, err = manager.ResumeTask(ctx, "tenant-a", "orders-to-snowflake")
+	require.NoError(t, err)
+	require.Len(t, runner.started, 2)
+
+	resumed, err := manager.GetTask(ctx, "tenant-a", "orders-to-snowflake")
+	require.NoError(t, err)
+	require.Equal(t, model.TaskStatusRunning, resumed.Status)
+}
+
+func TestManagerStartsLoadedTasksForRecovery(t *testing.T) {
+	ctx := context.Background()
+	manager := newTestManager(t)
+	manifest, err := manager.CreateTask(ctx, "tenant-a", validCreateTaskRequest())
+	require.NoError(t, err)
+
+	runner := &fakeRunner{}
+	manager.SetTaskRunner(runner)
+
+	require.NoError(t, manager.StartLoadedTasks(ctx))
+	require.Len(t, runner.started, 1)
+	require.Equal(t, manifest.TaskID, runner.started[0].TaskID)
+}
+
 func newTestManager(t *testing.T) *tenant.Manager {
 	t.Helper()
 
@@ -129,4 +189,47 @@ func newTestManager(t *testing.T) *tenant.Manager {
 	}, taskstore.NewMemoryStoreFactory())
 	require.NoError(t, err)
 	return manager
+}
+
+func validCreateTaskRequest() model.CreateTaskRequest {
+	return model.CreateTaskRequest{
+		TaskID: "orders-to-snowflake",
+		Mode:   model.TaskModeFull,
+		Source: model.TaskSource{
+			TableFilter: model.TableFilter{Include: []string{"orders.*"}, CaseSensitive: false},
+			Tables: []model.TableBinding{
+				{
+					Database:       "orders",
+					Table:          "orders",
+					TargetDatabase: "ANALYTICS",
+					TargetSchema:   "TENANT_A",
+					TargetTable:    "orders",
+				},
+			},
+		},
+		Storage: model.StorageConfig{URI: "s3://company-replication/tenants/tenant-a"},
+		Sink:    model.SinkConfig{Type: model.SinkTypeSnowflake, Database: "ANALYTICS", Schema: "TENANT_A"},
+	}
+}
+
+type fakeRunner struct {
+	validateErr error
+	validated   []model.TaskManifest
+	started     []model.TaskManifest
+	stopped     []string
+}
+
+func (r *fakeRunner) ValidateTask(_ context.Context, _ model.TenantConfig, manifest model.TaskManifest) error {
+	r.validated = append(r.validated, manifest)
+	return r.validateErr
+}
+
+func (r *fakeRunner) StartTask(_ context.Context, _ model.TenantConfig, manifest model.TaskManifest, _ taskstore.Store) error {
+	r.started = append(r.started, manifest)
+	return nil
+}
+
+func (r *fakeRunner) StopTask(_ context.Context, tenantConfig model.TenantConfig, taskID string) error {
+	r.stopped = append(r.stopped, tenantConfig.TenantID+"/"+taskID)
+	return nil
 }

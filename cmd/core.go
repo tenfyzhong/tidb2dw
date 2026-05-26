@@ -244,7 +244,30 @@ func Replicate(
 	parrallelLoad bool,
 	mode RunMode,
 ) error {
-	ctx := context.Background()
+	return ReplicateWithContext(context.Background(), tidbConfig, tables, storageURI, snapshotURI, incrementURI,
+		snapshotConcurrency, cdcHost, cdcPort, cdcFlushInterval, cdcFileSize,
+		snapConnectorMap, increConnectorMap, csvOutputDialect, parrallelLoad, mode,
+	)
+}
+
+func ReplicateWithContext(
+	ctx context.Context,
+	tidbConfig *tidbsql.TiDBConfig,
+	tables []string,
+	storageURI *url.URL,
+	snapshotURI *url.URL,
+	incrementURI *url.URL,
+	snapshotConcurrency int,
+	cdcHost string,
+	cdcPort int,
+	cdcFlushInterval time.Duration,
+	cdcFileSize int,
+	snapConnectorMap map[string]coreinterfaces.Connector,
+	increConnectorMap map[string]coreinterfaces.Connector,
+	csvOutputDialect string,
+	parrallelLoad bool,
+	mode RunMode,
+) error {
 	metrics.TableNumGauge.Add(float64(len(tables)))
 	if err := Export(ctx, tidbConfig, tables, storageURI, snapshotURI, incrementURI,
 		snapshotConcurrency, cdcHost, cdcPort, cdcFlushInterval, cdcFileSize, csvOutputDialect, mode); err != nil {

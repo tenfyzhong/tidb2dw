@@ -82,6 +82,48 @@ func TestTenantAPIRejectsCrossTenantBody(t *testing.T) {
 	require.Contains(t, recorder.Body.String(), "tenant_id")
 }
 
+func TestTenantAPIPauseAndResumeTask(t *testing.T) {
+	manager := newAPITestManager(t)
+	service := apiservice.New()
+	service.RegisterTenantManager(manager)
+
+	body, err := json.Marshal(model.CreateTaskRequest{
+		TaskID: "orders-to-snowflake",
+		Mode:   model.TaskModeFull,
+		Source: model.TaskSource{
+			TableFilter: model.TableFilter{Include: []string{"orders.*"}},
+			Tables: []model.TableBinding{
+				{Database: "orders", Table: "orders", TargetDatabase: "ANALYTICS", TargetSchema: "TENANT_A", TargetTable: "orders"},
+			},
+		},
+		Storage: model.StorageConfig{URI: "s3://company-replication/tenants/tenant-a"},
+		Sink:    model.SinkConfig{Type: model.SinkTypeSnowflake, Database: "ANALYTICS", Schema: "TENANT_A"},
+	})
+	require.NoError(t, err)
+
+	createRecorder := httptest.NewRecorder()
+	createReq := httptest.NewRequest(http.MethodPost, "/api/v1/tenants/tenant-a/tasks", bytes.NewReader(body))
+	createReq.Header.Set("Content-Type", "application/json")
+	service.ServeHTTP(createRecorder, createReq)
+	require.Equal(t, http.StatusCreated, createRecorder.Code)
+
+	pauseRecorder := httptest.NewRecorder()
+	service.ServeHTTP(pauseRecorder, httptest.NewRequest(http.MethodPost, "/api/v1/tenants/tenant-a/tasks/orders-to-snowflake:pause", nil))
+	require.Equal(t, http.StatusOK, pauseRecorder.Code)
+
+	var paused model.TaskManifest
+	require.NoError(t, json.Unmarshal(pauseRecorder.Body.Bytes(), &paused))
+	require.Equal(t, model.TaskStatusPaused, paused.Status)
+
+	resumeRecorder := httptest.NewRecorder()
+	service.ServeHTTP(resumeRecorder, httptest.NewRequest(http.MethodPost, "/api/v1/tenants/tenant-a/tasks/orders-to-snowflake:resume", nil))
+	require.Equal(t, http.StatusOK, resumeRecorder.Code)
+
+	var resumed model.TaskManifest
+	require.NoError(t, json.Unmarshal(resumeRecorder.Body.Bytes(), &resumed))
+	require.Equal(t, model.TaskStatusRunning, resumed.Status)
+}
+
 func TestTenantAPIInfoIncludesLoadedTenantCount(t *testing.T) {
 	manager := newAPITestManager(t)
 	service := apiservice.New()

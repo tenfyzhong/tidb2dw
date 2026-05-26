@@ -1,12 +1,15 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/pingcap-inc/tidb2dw/pkg/apiservice"
 	"github.com/pingcap-inc/tidb2dw/pkg/coreinterfaces"
+	"github.com/pingcap-inc/tidb2dw/pkg/model"
 	"github.com/pingcap-inc/tidb2dw/pkg/snowsql"
 	"github.com/pingcap-inc/tidb2dw/pkg/taskstore"
 	"github.com/pingcap-inc/tidb2dw/pkg/tenant"
@@ -14,6 +17,7 @@ import (
 	"github.com/pingcap-inc/tidb2dw/pkg/utils"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/log"
+	"github.com/pingcap/tidb/br/pkg/storage"
 	"github.com/pingcap/tiflow/pkg/logutil"
 	putil "github.com/pingcap/tiflow/pkg/util"
 	"github.com/spf13/cobra"
@@ -62,8 +66,39 @@ func NewSnowflakeCmd() *cobra.Command {
 			if err != nil {
 				return errors.Trace(err)
 			}
-			manager, err := tenant.NewManager(registry, taskstore.NewExternalStoreFactory(putil.GetExternalStorageFromURI))
+			defaultAWSCredentials := credentials.Value{}
+			if awsAccessKey != "" && awsSecretKey != "" {
+				defaultAWSCredentials = credentials.Value{
+					AccessKeyID:     awsAccessKey,
+					SecretAccessKey: awsSecretKey,
+				}
+			}
+			manager, err := tenant.NewManager(registry, taskstore.NewExternalStoreFactory(func(ctx context.Context, tenantConfig model.TenantConfig) (storage.ExternalStorage, error) {
+				awsCredentials, err := mergeAWSCredentials(defaultAWSCredentials, tenantConfig.StorageCredentials, tenantConfig.StorageURI)
+				if err != nil {
+					return nil, err
+				}
+				storageURI, err := buildStorageURIWithCredentials(tenantConfig.StorageURI, awsCredentials)
+				if err != nil {
+					return nil, err
+				}
+				storageURI.Path = strings.TrimSuffix(storageURI.Path, "/")
+				return putil.GetExternalStorageFromURI(ctx, storageURI.String())
+			}))
 			if err != nil {
+				return errors.Trace(err)
+			}
+			taskRunner := NewSnowflakeTaskRunner(SnowflakeTaskRunnerConfig{
+				DefaultTiDB:                tidbConfigFromCli,
+				DefaultCDC:                 model.SourceCDCConfig{Host: cdcHost, Port: cdcPort},
+				DefaultSnowflake:           snowflakeConfigFromCli,
+				DefaultAWSCredentials:      defaultAWSCredentials,
+				DefaultSnapshotConcurrency: snapshotConcurrency,
+				DefaultCDCFlushInterval:    cdcFlushInterval,
+				DefaultCDCFileSize:         cdcFileSize,
+			})
+			manager.SetTaskRunner(taskRunner)
+			if err := manager.StartLoadedTasks(context.Background()); err != nil {
 				return errors.Trace(err)
 			}
 			apiservice.GlobalInstance.RegisterTenantManager(manager)

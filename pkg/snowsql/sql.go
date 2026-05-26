@@ -49,7 +49,32 @@ DROP STAGE IF EXISTS {stageName};
 }
 
 func LoadSnapshotFromStage(db *sql.DB, targetTable, stageName, filePath string) error {
-	sql, err := formatter.Format(`
+	sql, err := GenLoadSnapshotFromStageDefaultSQL(targetTable, stageName, filePath)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	_, err = db.Exec(sql)
+	return err
+}
+
+func LoadSnapshotFromStageWithProjection(
+	db *sql.DB,
+	targetTable string,
+	stageName string,
+	filePath string,
+	columns []cloudstorage.TableCol,
+	positions []int,
+) error {
+	sql, err := GenLoadSnapshotFromStageSQL(targetTable, stageName, filePath, columns, positions)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	_, err = db.Exec(sql)
+	return err
+}
+
+func GenLoadSnapshotFromStageDefaultSQL(targetTable, stageName, filePath string) (string, error) {
+	return formatter.Format(`
 COPY INTO {targetTable}
 FROM @{stageName}/{filePath}
 FILE_FORMAT = (TYPE = 'CSV' EMPTY_FIELD_AS_NULL = FALSE NULL_IF=('\\N') FIELD_OPTIONALLY_ENCLOSED_BY='"' ESCAPE='\\' BINARY_FORMAT = 'UTF8');
@@ -58,11 +83,6 @@ FILE_FORMAT = (TYPE = 'CSV' EMPTY_FIELD_AS_NULL = FALSE NULL_IF=('\\N') FIELD_OP
 		"stageName":   utils.EscapeString(stageName),
 		"filePath":    utils.EscapeString(filePath),
 	})
-	if err != nil {
-		return errors.Trace(err)
-	}
-	_, err = db.Exec(sql)
-	return err
 }
 
 func GetDefaultString(val interface{}) string {
@@ -78,6 +98,14 @@ func GenCreateSchema(sourceDatabase string, sourceTable string, sourceTiDBConn *
 	if err != nil {
 		return "", errors.Trace(err)
 	}
+	snowflakePKColumns, err := tidbsql.GetTiDBTablePKColumns(sourceTiDBConn, sourceDatabase, sourceTable)
+	if err != nil {
+		return "", errors.Trace(err)
+	}
+	return GenCreateSchemaWithColumns(sourceTable, tableColumns, snowflakePKColumns)
+}
+
+func GenCreateSchemaWithColumns(targetTable string, tableColumns []cloudstorage.TableCol, snowflakePKColumns []string) (string, error) {
 	columnRows := make([]string, 0, len(tableColumns))
 	for _, column := range tableColumns {
 		row, err := GetSnowflakeColumnString(column)
@@ -85,11 +113,6 @@ func GenCreateSchema(sourceDatabase string, sourceTable string, sourceTiDBConn *
 			return "", errors.Trace(err)
 		}
 		columnRows = append(columnRows, row)
-	}
-
-	snowflakePKColumns, err := tidbsql.GetTiDBTablePKColumns(sourceTiDBConn, sourceDatabase, sourceTable)
-	if err != nil {
-		return "", errors.Trace(err)
 	}
 
 	// TODO: Support unique key
@@ -105,7 +128,7 @@ func GenCreateSchema(sourceDatabase string, sourceTable string, sourceTiDBConn *
 	}
 
 	sql := []string{}
-	sql = append(sql, fmt.Sprintf(`CREATE OR REPLACE TABLE %s (`, sourceTable)) // TODO: Escape
+	sql = append(sql, fmt.Sprintf(`CREATE OR REPLACE TABLE %s (`, targetTable)) // TODO: Escape
 	sql = append(sql, strings.Join(sqlRows, ",\n"))
 	sql = append(sql, ")")
 

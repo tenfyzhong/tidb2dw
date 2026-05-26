@@ -41,11 +41,25 @@ type TenantRegistry struct {
 }
 
 type TenantConfig struct {
-	TenantID   string       `json:"tenant_id"`
-	Keyspace   string       `json:"keyspace"`
-	StorageURI string       `json:"storage_uri"`
-	SinkPolicy SinkPolicy   `json:"sink_policy,omitempty"`
-	Limits     TenantLimits `json:"limits,omitempty"`
+	TenantID           string             `json:"tenant_id"`
+	Keyspace           string             `json:"keyspace"`
+	StorageURI         string             `json:"storage_uri"`
+	StorageCredentials AWSCredentials     `json:"storage_credentials,omitempty"`
+	Source             TenantSourceConfig `json:"source,omitempty"`
+	Sink               SinkConfig         `json:"sink,omitempty"`
+	SinkPolicy         SinkPolicy         `json:"sink_policy,omitempty"`
+	Limits             TenantLimits       `json:"limits,omitempty"`
+}
+
+type TenantSourceConfig struct {
+	TiDB SourceTiDBConfig `json:"tidb,omitempty"`
+	CDC  SourceCDCConfig  `json:"cdc,omitempty"`
+}
+
+type AWSCredentials struct {
+	AccessKeyID     string `json:"access_key_id,omitempty"`
+	SecretAccessKey string `json:"secret_access_key,omitempty"`
+	SessionToken    string `json:"session_token,omitempty"`
 }
 
 type SinkPolicy struct {
@@ -98,6 +112,7 @@ type SourceTiDBConfig struct {
 	Host  string `json:"host,omitempty"`
 	Port  int    `json:"port,omitempty"`
 	User  string `json:"user,omitempty"`
+	Pass  string `json:"pass,omitempty"`
 	SSLCA string `json:"ssl_ca,omitempty"`
 }
 
@@ -136,6 +151,8 @@ type SinkConfig struct {
 	Type        SinkType `json:"type"`
 	AccountID   string   `json:"account_id,omitempty"`
 	Warehouse   string   `json:"warehouse,omitempty"`
+	User        string   `json:"user,omitempty"`
+	Pass        string   `json:"pass,omitempty"`
 	Database    string   `json:"database,omitempty"`
 	Schema      string   `json:"schema,omitempty"`
 	TableNaming string   `json:"table_naming,omitempty"`
