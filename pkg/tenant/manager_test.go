@@ -124,6 +124,32 @@ func TestManagerValidatesBeforePersistingAndStartingTask(t *testing.T) {
 	require.Empty(t, listed)
 }
 
+func TestManagerAllowsRunnerToResolveTablesFromTableFilter(t *testing.T) {
+	ctx := context.Background()
+	manager := newTestManager(t)
+	runner := &fakeRunner{
+		prepare: func(_ context.Context, _ model.TenantConfig, manifest model.TaskManifest) (model.TaskManifest, error) {
+			require.Empty(t, manifest.Source.Tables)
+			manifest.Source.Tables = []model.TableBinding{
+				{Database: "orders", Table: "orders", TargetDatabase: "ANALYTICS", TargetSchema: "TENANT_A", TargetTable: "orders"},
+			}
+			return manifest, nil
+		},
+	}
+	manager.SetTaskRunner(runner)
+
+	req := validCreateTaskRequest()
+	req.Source.Tables = nil
+	manifest, err := manager.CreateTask(ctx, "tenant-a", req)
+	require.NoError(t, err)
+	require.Equal(t, []model.TableBinding{
+		{Database: "orders", Table: "orders", TargetDatabase: "ANALYTICS", TargetSchema: "TENANT_A", TargetTable: "orders"},
+	}, manifest.Source.Tables)
+	require.Len(t, runner.prepared, 1)
+	require.Len(t, runner.validated, 1)
+	require.Len(t, runner.started, 1)
+}
+
 func TestManagerStartsPausesAndResumesTasks(t *testing.T) {
 	ctx := context.Background()
 	manager := newTestManager(t)
@@ -139,6 +165,7 @@ func TestManagerStartsPausesAndResumesTasks(t *testing.T) {
 	_, err = manager.PauseTask(ctx, "tenant-a", "orders-to-snowflake")
 	require.NoError(t, err)
 	require.Equal(t, []string{"tenant-a/orders-to-snowflake"}, runner.stopped)
+	require.Equal(t, []string{"tenant-a/orders-to-snowflake"}, runner.paused)
 
 	paused, err := manager.GetTask(ctx, "tenant-a", "orders-to-snowflake")
 	require.NoError(t, err)
@@ -151,6 +178,48 @@ func TestManagerStartsPausesAndResumesTasks(t *testing.T) {
 	resumed, err := manager.GetTask(ctx, "tenant-a", "orders-to-snowflake")
 	require.NoError(t, err)
 	require.Equal(t, model.TaskStatusRunning, resumed.Status)
+}
+
+func TestManagerDeletesTaskThroughRunnerBeforeTombstone(t *testing.T) {
+	ctx := context.Background()
+	manager := newTestManager(t)
+	runner := &fakeRunner{}
+	manager.SetTaskRunner(runner)
+
+	_, err := manager.CreateTask(ctx, "tenant-a", validCreateTaskRequest())
+	require.NoError(t, err)
+	require.NoError(t, manager.TombstoneTask(ctx, "tenant-a", "orders-to-snowflake"))
+
+	require.Equal(t, []string{"tenant-a/orders-to-snowflake"}, runner.deleted)
+	_, err = manager.GetTask(ctx, "tenant-a", "orders-to-snowflake")
+	require.ErrorContains(t, err, "tombstoned")
+}
+
+func TestManagerEnforcesTenantTableWorkerQuota(t *testing.T) {
+	ctx := context.Background()
+	manager, err := tenant.NewManager(model.TenantRegistry{
+		Tenants: []model.TenantConfig{
+			{
+				TenantID:   "tenant-a",
+				Keyspace:   "keyspace_a",
+				StorageURI: "s3://company-replication/tenants/tenant-a",
+				SinkPolicy: model.SinkPolicy{
+					AllowedDatabases: []string{"ANALYTICS"},
+					AllowedSchemas:   []string{"TENANT_A"},
+				},
+				Limits: model.TenantLimits{MaxTableWorkers: 1},
+			},
+		},
+	}, taskstore.NewMemoryStoreFactory())
+	require.NoError(t, err)
+
+	_, err = manager.CreateTask(ctx, "tenant-a", validCreateTaskRequest())
+	require.NoError(t, err)
+
+	second := validCreateTaskRequest()
+	second.TaskID = "second-task"
+	_, err = manager.CreateTask(ctx, "tenant-a", second)
+	require.ErrorContains(t, err, "tenant table worker quota")
 }
 
 func TestManagerStartsLoadedTasksForRecovery(t *testing.T) {
@@ -214,9 +283,21 @@ func validCreateTaskRequest() model.CreateTaskRequest {
 
 type fakeRunner struct {
 	validateErr error
+	prepare     func(context.Context, model.TenantConfig, model.TaskManifest) (model.TaskManifest, error)
+	prepared    []model.TaskManifest
 	validated   []model.TaskManifest
 	started     []model.TaskManifest
 	stopped     []string
+	paused      []string
+	deleted     []string
+}
+
+func (r *fakeRunner) PrepareTask(ctx context.Context, tenantConfig model.TenantConfig, manifest model.TaskManifest) (model.TaskManifest, error) {
+	r.prepared = append(r.prepared, manifest)
+	if r.prepare != nil {
+		return r.prepare(ctx, tenantConfig, manifest)
+	}
+	return manifest, nil
 }
 
 func (r *fakeRunner) ValidateTask(_ context.Context, _ model.TenantConfig, manifest model.TaskManifest) error {
@@ -231,5 +312,15 @@ func (r *fakeRunner) StartTask(_ context.Context, _ model.TenantConfig, manifest
 
 func (r *fakeRunner) StopTask(_ context.Context, tenantConfig model.TenantConfig, taskID string) error {
 	r.stopped = append(r.stopped, tenantConfig.TenantID+"/"+taskID)
+	return nil
+}
+
+func (r *fakeRunner) PauseTask(_ context.Context, tenantConfig model.TenantConfig, manifest model.TaskManifest) error {
+	r.paused = append(r.paused, tenantConfig.TenantID+"/"+manifest.TaskID)
+	return r.StopTask(context.Background(), tenantConfig, manifest.TaskID)
+}
+
+func (r *fakeRunner) DeleteTask(_ context.Context, tenantConfig model.TenantConfig, manifest model.TaskManifest) error {
+	r.deleted = append(r.deleted, tenantConfig.TenantID+"/"+manifest.TaskID)
 	return nil
 }

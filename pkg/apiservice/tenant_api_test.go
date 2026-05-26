@@ -139,6 +139,66 @@ func TestTenantAPIInfoIncludesLoadedTenantCount(t *testing.T) {
 	require.Equal(t, apiservice.ServiceStatusRunning, info.Status)
 }
 
+func TestTenantAPIRequiresTenantBearerTokenWhenConfigured(t *testing.T) {
+	manager, err := tenant.NewManager(model.TenantRegistry{
+		Tenants: []model.TenantConfig{
+			{
+				TenantID:   "tenant-a",
+				Keyspace:   "keyspace_a",
+				StorageURI: "s3://company-replication/tenants/tenant-a",
+				Auth:       model.TenantAuth{BearerToken: "token-a"},
+				SinkPolicy: model.SinkPolicy{
+					AllowedDatabases: []string{"ANALYTICS"},
+					AllowedSchemas:   []string{"TENANT_A"},
+				},
+			},
+			{
+				TenantID:   "tenant-b",
+				Keyspace:   "keyspace_b",
+				StorageURI: "s3://company-replication/tenants/tenant-b",
+				Auth:       model.TenantAuth{BearerToken: "token-b"},
+			},
+		},
+	}, taskstore.NewMemoryStoreFactory())
+	require.NoError(t, err)
+	service := apiservice.New()
+	service.RegisterTenantManager(manager)
+
+	body, err := json.Marshal(model.CreateTaskRequest{
+		TaskID: "orders-to-snowflake",
+		Mode:   model.TaskModeFull,
+		Source: model.TaskSource{
+			TableFilter: model.TableFilter{Include: []string{"orders.*"}},
+			Tables: []model.TableBinding{
+				{Database: "orders", Table: "orders", TargetDatabase: "ANALYTICS", TargetSchema: "TENANT_A", TargetTable: "orders"},
+			},
+		},
+		Storage: model.StorageConfig{URI: "s3://company-replication/tenants/tenant-a"},
+		Sink:    model.SinkConfig{Type: model.SinkTypeSnowflake, Database: "ANALYTICS", Schema: "TENANT_A"},
+	})
+	require.NoError(t, err)
+
+	noTokenRecorder := httptest.NewRecorder()
+	noTokenReq := httptest.NewRequest(http.MethodPost, "/api/v1/tenants/tenant-a/tasks", bytes.NewReader(body))
+	noTokenReq.Header.Set("Content-Type", "application/json")
+	service.ServeHTTP(noTokenRecorder, noTokenReq)
+	require.Equal(t, http.StatusUnauthorized, noTokenRecorder.Code)
+
+	wrongTokenRecorder := httptest.NewRecorder()
+	wrongTokenReq := httptest.NewRequest(http.MethodPost, "/api/v1/tenants/tenant-a/tasks", bytes.NewReader(body))
+	wrongTokenReq.Header.Set("Content-Type", "application/json")
+	wrongTokenReq.Header.Set("Authorization", "Bearer token-b")
+	service.ServeHTTP(wrongTokenRecorder, wrongTokenReq)
+	require.Equal(t, http.StatusForbidden, wrongTokenRecorder.Code)
+
+	okRecorder := httptest.NewRecorder()
+	okReq := httptest.NewRequest(http.MethodPost, "/api/v1/tenants/tenant-a/tasks", bytes.NewReader(body))
+	okReq.Header.Set("Content-Type", "application/json")
+	okReq.Header.Set("Authorization", "Bearer token-a")
+	service.ServeHTTP(okRecorder, okReq)
+	require.Equal(t, http.StatusCreated, okRecorder.Code)
+}
+
 func newAPITestManager(t *testing.T) *tenant.Manager {
 	t.Helper()
 

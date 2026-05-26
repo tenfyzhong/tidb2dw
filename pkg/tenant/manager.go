@@ -2,6 +2,7 @@ package tenant
 
 import (
 	"context"
+	"crypto/subtle"
 	"fmt"
 	"sort"
 	"strings"
@@ -30,11 +31,25 @@ type TaskRunner interface {
 	StopTask(ctx context.Context, tenantConfig model.TenantConfig, taskID string) error
 }
 
+type TaskPreparer interface {
+	PrepareTask(ctx context.Context, tenantConfig model.TenantConfig, manifest model.TaskManifest) (model.TaskManifest, error)
+}
+
+type TaskLifecycleRunner interface {
+	PauseTask(ctx context.Context, tenantConfig model.TenantConfig, manifest model.TaskManifest) error
+	DeleteTask(ctx context.Context, tenantConfig model.TenantConfig, manifest model.TaskManifest) error
+}
+
 type Status struct {
 	TenantID string             `json:"tenant_id"`
 	Keyspace string             `json:"keyspace"`
 	Limits   model.TenantLimits `json:"limits,omitempty"`
 }
+
+var (
+	ErrUnauthorized = fmt.Errorf("missing or invalid bearer token")
+	ErrForbidden    = fmt.Errorf("bearer token is not authorized for tenant")
+)
 
 func NewManager(registry model.TenantRegistry, factory taskstore.Factory) (*Manager, error) {
 	if factory == nil {
@@ -111,6 +126,15 @@ func (m *Manager) CreateTask(ctx context.Context, tenantID string, req model.Cre
 	if err != nil {
 		return model.TaskManifest{}, err
 	}
+	if preparer, ok := m.runner.(TaskPreparer); ok {
+		manifest, err = preparer.PrepareTask(ctx, tenantCtx.Config, manifest)
+		if err != nil {
+			return model.TaskManifest{}, err
+		}
+	}
+	if err := validateTaskManifestForTenant(tenantCtx.Config, manifest); err != nil {
+		return model.TaskManifest{}, err
+	}
 
 	if m.runner != nil {
 		if err := m.runner.ValidateTask(ctx, tenantCtx.Config, manifest); err != nil {
@@ -121,6 +145,9 @@ func (m *Manager) CreateTask(ctx context.Context, tenantID string, req model.Cre
 	tenantCtx.mu.Lock()
 	defer tenantCtx.mu.Unlock()
 
+	if err := tenantCtx.ensureTableWorkerQuota(ctx, manifest, false); err != nil {
+		return model.TaskManifest{}, err
+	}
 	if err := tenantCtx.store.CreateManifest(ctx, manifest); err != nil {
 		return model.TaskManifest{}, err
 	}
@@ -155,9 +182,19 @@ func (m *Manager) TombstoneTask(ctx context.Context, tenantID string, taskID str
 	}
 	tenantCtx.mu.Lock()
 	defer tenantCtx.mu.Unlock()
+	manifest, err := tenantCtx.store.GetManifest(ctx, taskID)
+	if err != nil {
+		return err
+	}
 	if m.runner != nil {
-		if err := m.runner.StopTask(ctx, tenantCtx.Config, taskID); err != nil {
-			return err
+		if lifecycle, ok := m.runner.(TaskLifecycleRunner); ok {
+			if err := lifecycle.DeleteTask(ctx, tenantCtx.Config, manifest); err != nil {
+				return err
+			}
+		} else {
+			if err := m.runner.StopTask(ctx, tenantCtx.Config, taskID); err != nil {
+				return err
+			}
 		}
 	}
 	return tenantCtx.store.TombstoneManifest(ctx, taskID, time.Now().UTC())
@@ -176,8 +213,14 @@ func (m *Manager) PauseTask(ctx context.Context, tenantID string, taskID string)
 		return model.TaskManifest{}, err
 	}
 	if m.runner != nil {
-		if err := m.runner.StopTask(ctx, tenantCtx.Config, taskID); err != nil {
-			return model.TaskManifest{}, err
+		if lifecycle, ok := m.runner.(TaskLifecycleRunner); ok {
+			if err := lifecycle.PauseTask(ctx, tenantCtx.Config, manifest); err != nil {
+				return model.TaskManifest{}, err
+			}
+		} else {
+			if err := m.runner.StopTask(ctx, tenantCtx.Config, taskID); err != nil {
+				return model.TaskManifest{}, err
+			}
 		}
 	}
 	manifest.Status = model.TaskStatusPaused
@@ -200,13 +243,16 @@ func (m *Manager) ResumeTask(ctx context.Context, tenantID string, taskID string
 	if err != nil {
 		return model.TaskManifest{}, err
 	}
-	manifest.Status = model.TaskStatusRunning
-	manifest.UpdatedAt = time.Now().UTC()
+	if err := tenantCtx.ensureTableWorkerQuota(ctx, manifest, true); err != nil {
+		return model.TaskManifest{}, err
+	}
 	if m.runner != nil {
 		if err := m.runner.StartTask(ctx, tenantCtx.Config, manifest, tenantCtx.store); err != nil {
 			return model.TaskManifest{}, err
 		}
 	}
+	manifest.Status = model.TaskStatusRunning
+	manifest.UpdatedAt = time.Now().UTC()
 	if err := tenantCtx.store.UpdateManifest(ctx, manifest); err != nil {
 		return model.TaskManifest{}, err
 	}
@@ -234,6 +280,64 @@ func (m *Manager) StartLoadedTasks(ctx context.Context) error {
 	return nil
 }
 
+func (m *Manager) AuthEnabled() bool {
+	for _, tenantCtx := range m.tenants {
+		if tenantCtx.Config.Auth.BearerToken != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Manager) AuthorizeTenantAccess(tenantID string, token string) error {
+	if !m.AuthEnabled() {
+		return nil
+	}
+	if token == "" {
+		return ErrUnauthorized
+	}
+	tenantCtx, err := m.getContext(tenantID)
+	if err != nil {
+		return err
+	}
+	if tenantCtx.Config.Auth.BearerToken == "" {
+		return ErrForbidden
+	}
+	if subtle.ConstantTimeCompare([]byte(token), []byte(tenantCtx.Config.Auth.BearerToken)) != 1 {
+		return ErrForbidden
+	}
+	return nil
+}
+
+func (m *Manager) AuthorizedTenants(token string) ([]Status, error) {
+	if !m.AuthEnabled() {
+		return m.ListTenants(), nil
+	}
+	if token == "" {
+		return nil, ErrUnauthorized
+	}
+	statuses := make([]Status, 0, len(m.tenants))
+	for _, tenantCtx := range m.tenants {
+		if tenantCtx.Config.Auth.BearerToken == "" {
+			continue
+		}
+		if subtle.ConstantTimeCompare([]byte(token), []byte(tenantCtx.Config.Auth.BearerToken)) == 1 {
+			statuses = append(statuses, Status{
+				TenantID: tenantCtx.Config.TenantID,
+				Keyspace: tenantCtx.Config.Keyspace,
+				Limits:   tenantCtx.Config.Limits,
+			})
+		}
+	}
+	if len(statuses) == 0 {
+		return nil, ErrForbidden
+	}
+	sort.Slice(statuses, func(i, j int) bool {
+		return statuses[i].TenantID < statuses[j].TenantID
+	})
+	return statuses, nil
+}
+
 func (m *Manager) getContext(tenantID string) (*Context, error) {
 	tenantCtx, ok := m.tenants[tenantID]
 	if !ok {
@@ -255,25 +359,36 @@ func validateTenantBoundRequest(tenantConfig model.TenantConfig, req model.Creat
 	if len(req.Source.TableFilter.Include) == 0 {
 		return fmt.Errorf("source.table_filter.include must not be empty")
 	}
-	if len(req.Source.Tables) == 0 {
-		return fmt.Errorf("source.tables must not be empty for the first multi-tenant implementation")
-	}
 	if req.Sink.Type != "" && req.Sink.Type != model.SinkTypeSnowflake {
 		return fmt.Errorf("unsupported sink type %q", req.Sink.Type)
 	}
 	if err := validateSinkTarget(tenantConfig.SinkPolicy, req.Sink.Database, req.Sink.Schema); err != nil {
 		return err
 	}
-	targets := make(map[string]model.TableBinding, len(req.Source.Tables))
-	for _, binding := range req.Source.Tables {
+	return validateTaskBindingsForTenant(tenantConfig, req.Source.Tables, req.Sink)
+}
+
+func validateTaskManifestForTenant(tenantConfig model.TenantConfig, manifest model.TaskManifest) error {
+	if len(manifest.Source.Tables) == 0 {
+		return fmt.Errorf("source.tables must not be empty after resolving source.table_filter")
+	}
+	if manifest.Sink.Type != "" && manifest.Sink.Type != model.SinkTypeSnowflake {
+		return fmt.Errorf("unsupported sink type %q", manifest.Sink.Type)
+	}
+	return validateTaskBindingsForTenant(tenantConfig, manifest.Source.Tables, manifest.Sink)
+}
+
+func validateTaskBindingsForTenant(tenantConfig model.TenantConfig, bindings []model.TableBinding, sink model.SinkConfig) error {
+	targets := make(map[string]model.TableBinding, len(bindings))
+	for _, binding := range bindings {
 		if binding.Database == "" || binding.Table == "" {
 			return fmt.Errorf("table binding source database and table must not be empty")
 		}
 		if filter.IsSystemSchema(binding.Database) {
 			return fmt.Errorf("table binding matched system schema %q", binding.Database)
 		}
-		targetDatabase := firstNonEmpty(binding.TargetDatabase, req.Sink.Database)
-		targetSchema := firstNonEmpty(binding.TargetSchema, req.Sink.Schema)
+		targetDatabase := firstNonEmpty(binding.TargetDatabase, sink.Database)
+		targetSchema := firstNonEmpty(binding.TargetSchema, sink.Schema)
 		targetTable := firstNonEmpty(binding.TargetTable, binding.Table)
 		if targetDatabase == "" {
 			return fmt.Errorf("target database must not be empty")
@@ -292,6 +407,39 @@ func validateTenantBoundRequest(tenantConfig model.TenantConfig, req model.Creat
 		targets[targetKey] = binding
 	}
 	return nil
+}
+
+func (c *Context) ensureTableWorkerQuota(ctx context.Context, incoming model.TaskManifest, replacingExisting bool) error {
+	quota := c.Config.Limits.MaxTableWorkers
+	if quota <= 0 {
+		return nil
+	}
+	manifests, err := c.store.ListManifests(ctx)
+	if err != nil {
+		return err
+	}
+	used := 0
+	for _, manifest := range manifests {
+		if replacingExisting && manifest.TaskID == incoming.TaskID {
+			continue
+		}
+		if manifest.Status == model.TaskStatusPaused || manifest.Status == model.TaskStatusDeleted {
+			continue
+		}
+		used += taskTableDemand(manifest)
+	}
+	requested := taskTableDemand(incoming)
+	if used+requested > quota {
+		return fmt.Errorf("tenant table worker quota exceeded: used=%d requested=%d limit=%d", used, requested, quota)
+	}
+	return nil
+}
+
+func taskTableDemand(manifest model.TaskManifest) int {
+	if len(manifest.Source.Tables) == 0 {
+		return 1
+	}
+	return len(manifest.Source.Tables)
 }
 
 func buildManifest(tenantConfig model.TenantConfig, req model.CreateTaskRequest) (model.TaskManifest, error) {

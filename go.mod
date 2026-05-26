@@ -4,6 +4,7 @@ go 1.21
 
 require (
 	cloud.google.com/go/bigquery v1.57.1
+	github.com/DATA-DOG/go-sqlmock v1.5.0
 	github.com/aws/aws-sdk-go v1.45.25
 	github.com/databricks/databricks-sql-go v1.4.0
 	github.com/gin-gonic/gin v1.9.1
@@ -28,7 +29,6 @@ require (
 	github.com/AthenZ/athenz v1.10.39 // indirect
 	github.com/Azure/go-ntlmssp v0.0.0-20221128193559-754e69321358 // indirect
 	github.com/AzureAD/microsoft-authentication-library-for-go v1.1.1 // indirect
-	github.com/DATA-DOG/go-sqlmock v1.5.0 // indirect
 	github.com/IBM/sarama v1.41.2 // indirect
 	github.com/KimMachineGun/automemlimit v0.2.4 // indirect
 	github.com/Masterminds/semver v1.5.0 // indirect

@@ -6,6 +6,7 @@ import (
 
 	"github.com/pingcap-inc/tidb2dw/pkg/filter"
 	"github.com/pingcap-inc/tidb2dw/pkg/model"
+	"github.com/pingcap-inc/tidb2dw/pkg/tidbsql"
 	"github.com/pingcap/tiflow/pkg/sink/cloudstorage"
 )
 
@@ -38,15 +39,48 @@ func ProjectSnowflakeColumns(
 }
 
 func ApplyTableBindingProjection(tableDef cloudstorage.TableDefinition, targetTable string, columnFilter model.ColumnFilter) (cloudstorage.TableDefinition, error) {
+	return ApplyTableBindingProjectionWithPolicy(nil, tableDef, targetTable, columnFilter)
+}
+
+func ApplyTableBindingProjectionWithPolicy(
+	prevProjectedColumns []cloudstorage.TableCol,
+	tableDef cloudstorage.TableDefinition,
+	targetTable string,
+	columnFilter model.ColumnFilter,
+) (cloudstorage.TableDefinition, error) {
 	tableDef.Table = firstNonEmpty(targetTable, tableDef.Table)
 	if columnFilter.Mode == "" {
 		return tableDef, nil
 	}
+	switch columnFilter.OnSchemaChange {
+	case "", model.ColumnFilterSchemaChangeIgnore, model.ColumnFilterSchemaChangeFail:
+	default:
+		return cloudstorage.TableDefinition{}, fmt.Errorf("unsupported column_filter.on_schema_change %q", columnFilter.OnSchemaChange)
+	}
+	originalColumnCount := len(tableDef.Columns)
 	projected, _, err := ProjectSnowflakeColumns(tableDef.Columns, columnFilter, nil)
 	if err != nil {
 		return cloudstorage.TableDefinition{}, err
 	}
 	tableDef.Columns = projected
+	if columnFilter.OnSchemaChange == model.ColumnFilterSchemaChangeFail &&
+		len(prevProjectedColumns) > 0 &&
+		originalColumnCount > len(projected) {
+		diffs, err := tidbsql.GetColumnDiff(prevProjectedColumns, projected)
+		if err != nil {
+			return cloudstorage.TableDefinition{}, err
+		}
+		hasProjectedChange := false
+		for _, diff := range diffs {
+			if diff.Action != tidbsql.UNCHANGE {
+				hasProjectedChange = true
+				break
+			}
+		}
+		if !hasProjectedChange {
+			return cloudstorage.TableDefinition{}, fmt.Errorf("DDL affects a filtered-out column and column_filter.on_schema_change is fail")
+		}
+	}
 	return tableDef, nil
 }
 

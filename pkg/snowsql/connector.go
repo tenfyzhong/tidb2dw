@@ -91,7 +91,7 @@ func (sc *SnowflakeConnector) ExecDDL(tableDef cloudstorage.TableDefinition) err
 		return errors.New("Columns not initialized. Maybe you execute a DDL before all DMLs, which is not supported now.")
 	}
 	var err error
-	tableDef, err = ApplyTableBindingProjection(tableDef, sc.targetTable, sc.columnFilter)
+	tableDef, err = ApplyTableBindingProjectionWithPolicy(sc.columns, tableDef, sc.targetTable, sc.columnFilter)
 	if err != nil {
 		return errors.Trace(err)
 	}

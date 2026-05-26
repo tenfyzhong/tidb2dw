@@ -72,6 +72,12 @@ var CdcCsvBinaryEncodingMethodMap = map[string]string{
 	"redshift":  tiflow_config.BinaryEncodingHex,
 }
 
+type CDCExportConfig struct {
+	Namespace       string
+	ChangefeedID    string
+	ColumnSelectors []cdc.ColumnSelector
+}
+
 func isChangeFeedCreated(ctx context.Context, storage storage.ExternalStorage) (bool, error) {
 	return storage.FileExists(ctx, "increment/metadata")
 }
@@ -175,6 +181,26 @@ func Export(
 	csvOutputDialect string,
 	mode RunMode,
 ) error {
+	return ExportWithCDCConfig(ctx, tidbConfig, tables, storageURI, snapshotURI, incrementURI,
+		snapshotConcurrency, cdcHost, cdcPort, cdcFlushInterval, cdcFileSize, csvOutputDialect, mode, CDCExportConfig{})
+}
+
+func ExportWithCDCConfig(
+	ctx context.Context,
+	tidbConfig *tidbsql.TiDBConfig,
+	tables []string,
+	storageURI *url.URL,
+	snapshotURI *url.URL,
+	incrementURI *url.URL,
+	snapshotConcurrency int,
+	cdcHost string,
+	cdcPort int,
+	cdcFlushInterval time.Duration,
+	cdcFileSize int,
+	csvOutputDialect string,
+	mode RunMode,
+	cdcExportConfig CDCExportConfig,
+) error {
 	storage, err := putil.GetExternalStorageFromURI(ctx, storageURI.String())
 	if err != nil {
 		return errors.Trace(err)
@@ -194,9 +220,14 @@ func Export(
 			return errors.Trace(err)
 		}
 		if !created {
-			cdcConnector, err := cdc.NewCDCConnector(
+			cdcConnector, err := cdc.NewCDCConnectorWithOptions(
 				cdcHost, cdcPort, tables, startTSO, incrementURI, cdcFlushInterval, cdcFileSize,
 				CdcCsvBinaryEncodingMethodMap[csvOutputDialect],
+				cdc.CDCConnectorOptions{
+					Namespace:       cdcExportConfig.Namespace,
+					ChangefeedID:    cdcExportConfig.ChangefeedID,
+					ColumnSelectors: cdcExportConfig.ColumnSelectors,
+				},
 			)
 			if err != nil {
 				return errors.Trace(err)
@@ -268,9 +299,33 @@ func ReplicateWithContext(
 	parrallelLoad bool,
 	mode RunMode,
 ) error {
+	return ReplicateWithCDCConfig(ctx, tidbConfig, tables, storageURI, snapshotURI, incrementURI,
+		snapshotConcurrency, cdcHost, cdcPort, cdcFlushInterval, cdcFileSize, snapConnectorMap,
+		increConnectorMap, csvOutputDialect, parrallelLoad, mode, CDCExportConfig{})
+}
+
+func ReplicateWithCDCConfig(
+	ctx context.Context,
+	tidbConfig *tidbsql.TiDBConfig,
+	tables []string,
+	storageURI *url.URL,
+	snapshotURI *url.URL,
+	incrementURI *url.URL,
+	snapshotConcurrency int,
+	cdcHost string,
+	cdcPort int,
+	cdcFlushInterval time.Duration,
+	cdcFileSize int,
+	snapConnectorMap map[string]coreinterfaces.Connector,
+	increConnectorMap map[string]coreinterfaces.Connector,
+	csvOutputDialect string,
+	parrallelLoad bool,
+	mode RunMode,
+	cdcExportConfig CDCExportConfig,
+) error {
 	metrics.TableNumGauge.Add(float64(len(tables)))
-	if err := Export(ctx, tidbConfig, tables, storageURI, snapshotURI, incrementURI,
-		snapshotConcurrency, cdcHost, cdcPort, cdcFlushInterval, cdcFileSize, csvOutputDialect, mode); err != nil {
+	if err := ExportWithCDCConfig(ctx, tidbConfig, tables, storageURI, snapshotURI, incrementURI,
+		snapshotConcurrency, cdcHost, cdcPort, cdcFlushInterval, cdcFileSize, csvOutputDialect, mode, cdcExportConfig); err != nil {
 		return errors.Trace(err)
 	}
 

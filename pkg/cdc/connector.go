@@ -24,11 +24,21 @@ type CDCConnector struct {
 	sinkURIConfig        *SinkURIConfig
 	SinkURI              *url.URL
 	binaryEncodingMethod string
+	namespace            string
+	changefeedID         string
+	columnSelectors      []ColumnSelector
 }
 
 func NewCDCConnector(
 	cdcHost string, cdcPort int, tables []string, startTSO uint64, storageUri *url.URL,
 	flushInterval time.Duration, fileSize int, binaryEncodingMethod string,
+) (*CDCConnector, error) {
+	return NewCDCConnectorWithOptions(cdcHost, cdcPort, tables, startTSO, storageUri, flushInterval, fileSize, binaryEncodingMethod, CDCConnectorOptions{})
+}
+
+func NewCDCConnectorWithOptions(
+	cdcHost string, cdcPort int, tables []string, startTSO uint64, storageUri *url.URL,
+	flushInterval time.Duration, fileSize int, binaryEncodingMethod string, options CDCConnectorOptions,
 ) (*CDCConnector, error) {
 	sinkURIConfig := &SinkURIConfig{
 		storageUri:    storageUri,
@@ -47,6 +57,9 @@ func NewCDCConnector(
 		sinkURIConfig:        sinkURIConfig,
 		SinkURI:              sinkURI,
 		binaryEncodingMethod: binaryEncodingMethod,
+		namespace:            options.Namespace,
+		changefeedID:         options.ChangefeedID,
+		columnSelectors:      options.ColumnSelectors,
 	}, nil
 }
 
@@ -62,7 +75,15 @@ func (c *CDCConnector) CreateChangefeed() error {
 	}
 	replicateCfg.Sink.DateSeparator = putil.AddressOf(config.DateSeparatorDay.String())
 	replicateCfg.Filter = &apiv2.FilterConfig{Rules: c.tables}
+	for _, selector := range c.columnSelectors {
+		replicateCfg.Sink.ColumnSelectors = append(replicateCfg.Sink.ColumnSelectors, &apiv2.ColumnSelector{
+			Matcher: selector.Matcher,
+			Columns: selector.Columns,
+		})
+	}
 	cfCfg := &ChangefeedConfig{
+		Namespace:     c.namespace,
+		ID:            c.changefeedID,
 		SinkURI:       c.SinkURI.String(),
 		ReplicaConfig: replicateCfg,
 	}
@@ -96,5 +117,54 @@ func (c *CDCConnector) CreateChangefeed() error {
 	replicateConfig := respData["config"].(map[string]interface{})
 	log.Info("create changefeed success", zap.String("changefeed-id", changefeedID), zap.Any("replica-config", replicateConfig))
 
+	return nil
+}
+
+func (c *CDCConnector) PauseChangefeed() error {
+	return c.lifecycleRequest(http.MethodPost, "pause", nil)
+}
+
+func (c *CDCConnector) ResumeChangefeed() error {
+	return c.lifecycleRequest(http.MethodPost, "resume", []byte(`{}`))
+}
+
+func (c *CDCConnector) DeleteChangefeed() error {
+	return c.lifecycleRequest(http.MethodDelete, "", nil)
+}
+
+func (c *CDCConnector) lifecycleRequest(method string, action string, body []byte) error {
+	if c.changefeedID == "" {
+		return errors.New("changefeed id must not be empty")
+	}
+	parts := []string{"api/v2/changefeeds", c.changefeedID}
+	if action != "" {
+		parts = append(parts, action)
+	}
+	reqURL, err := url.JoinPath(c.cdcServer, parts...)
+	if err != nil {
+		return errors.Annotate(err, "join url failed")
+	}
+	parsed, err := url.Parse(reqURL)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	if c.namespace != "" {
+		values := parsed.Query()
+		values.Set("namespace", c.namespace)
+		parsed.RawQuery = values.Encode()
+	}
+
+	httpReq, err := http.NewRequest(method, parsed.String(), bytes.NewReader(body))
+	if err != nil {
+		return errors.Trace(err)
+	}
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return errors.Errorf("%s changefeed failed, status code: %d", method, resp.StatusCode)
+	}
 	return nil
 }

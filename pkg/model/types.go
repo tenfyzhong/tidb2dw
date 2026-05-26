@@ -36,6 +36,11 @@ const (
 	ColumnFilterModeExclude ColumnFilterMode = "exclude"
 )
 
+const (
+	ColumnFilterSchemaChangeIgnore = "ignore"
+	ColumnFilterSchemaChangeFail   = "fail"
+)
+
 type TenantRegistry struct {
 	Tenants []TenantConfig `json:"tenants"`
 }
@@ -44,11 +49,16 @@ type TenantConfig struct {
 	TenantID           string             `json:"tenant_id"`
 	Keyspace           string             `json:"keyspace"`
 	StorageURI         string             `json:"storage_uri"`
+	Auth               TenantAuth         `json:"auth,omitempty"`
 	StorageCredentials AWSCredentials     `json:"storage_credentials,omitempty"`
 	Source             TenantSourceConfig `json:"source,omitempty"`
 	Sink               SinkConfig         `json:"sink,omitempty"`
 	SinkPolicy         SinkPolicy         `json:"sink_policy,omitempty"`
 	Limits             TenantLimits       `json:"limits,omitempty"`
+}
+
+type TenantAuth struct {
+	BearerToken string `json:"bearer_token,omitempty"`
 }
 
 type TenantSourceConfig struct {
@@ -117,8 +127,10 @@ type SourceTiDBConfig struct {
 }
 
 type SourceCDCConfig struct {
-	Host string `json:"host,omitempty"`
-	Port int    `json:"port,omitempty"`
+	Host         string `json:"host,omitempty"`
+	Port         int    `json:"port,omitempty"`
+	Namespace    string `json:"namespace,omitempty"`
+	ChangefeedID string `json:"changefeed_id,omitempty"`
 }
 
 type TableFilter struct {

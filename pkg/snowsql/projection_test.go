@@ -6,6 +6,7 @@ import (
 
 	"github.com/pingcap-inc/tidb2dw/pkg/model"
 	"github.com/pingcap-inc/tidb2dw/pkg/snowsql"
+	timodel "github.com/pingcap/tidb/pkg/parser/model"
 	"github.com/pingcap/tiflow/pkg/sink/cloudstorage"
 	"github.com/stretchr/testify/require"
 )
@@ -43,6 +44,29 @@ func TestGenLoadSnapshotFromStageWithProjection(t *testing.T) {
 	require.Contains(t, sql, "SELECT $1, $3")
 	require.Contains(t, sql, "FROM @snapshot_stage/orders.orders.000001.csv")
 	require.False(t, strings.Contains(sql, "customer_id"))
+}
+
+func TestApplyTableBindingProjectionFailsIgnoredDDLWhenConfigured(t *testing.T) {
+	prev := []cloudstorage.TableCol{
+		{ID: "1", Name: "id", Tp: "int", IsPK: "true"},
+		{ID: "2", Name: "status", Tp: "varchar"},
+	}
+	tableDef := cloudstorage.TableDefinition{
+		Type:  timodel.ActionAddColumn,
+		Table: "orders",
+		Columns: []cloudstorage.TableCol{
+			{ID: "1", Name: "id", Tp: "int", IsPK: "true"},
+			{ID: "2", Name: "status", Tp: "varchar"},
+			{ID: "3", Name: "internal_note", Tp: "varchar"},
+		},
+	}
+
+	_, err := snowsql.ApplyTableBindingProjectionWithPolicy(prev, tableDef, "", model.ColumnFilter{
+		Mode:           model.ColumnFilterModeInclude,
+		Columns:        []string{"id", "status"},
+		OnSchemaChange: model.ColumnFilterSchemaChangeFail,
+	})
+	require.ErrorContains(t, err, "filtered-out column")
 }
 
 func snowflakeColumnNames(columns []cloudstorage.TableCol) []string {

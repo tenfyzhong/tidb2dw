@@ -2,6 +2,8 @@ package cmd
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/url"
@@ -11,7 +13,9 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/pingcap-inc/tidb2dw/pkg/cdc"
 	"github.com/pingcap-inc/tidb2dw/pkg/coreinterfaces"
+	"github.com/pingcap-inc/tidb2dw/pkg/filter"
 	"github.com/pingcap-inc/tidb2dw/pkg/model"
 	"github.com/pingcap-inc/tidb2dw/pkg/snowsql"
 	"github.com/pingcap-inc/tidb2dw/pkg/taskstore"
@@ -28,7 +32,10 @@ type SnowflakeTaskRunnerConfig struct {
 	DefaultSnapshotConcurrency int
 	DefaultCDCFlushInterval    time.Duration
 	DefaultCDCFileSize         int
+	TableListProvider          TableListProvider
 }
+
+type TableListProvider func(ctx context.Context, tidbConfig tidbsql.TiDBConfig) ([]model.TableName, error)
 
 type SnowflakeTaskRunner struct {
 	cfg SnowflakeTaskRunnerConfig
@@ -74,10 +81,64 @@ func (r *SnowflakeTaskRunner) ValidateTask(ctx context.Context, tenantConfig mod
 	return r.validateTask(ctx, cfg)
 }
 
+func (r *SnowflakeTaskRunner) PrepareTask(ctx context.Context, tenantConfig model.TenantConfig, manifest model.TaskManifest) (model.TaskManifest, error) {
+	cfg, err := r.buildConfig(tenantConfig, manifest)
+	if err != nil {
+		return model.TaskManifest{}, err
+	}
+	manifest.Source.CDC.Namespace = cfg.cdcConfig.Namespace
+	manifest.Source.CDC.ChangefeedID = cfg.cdcConfig.ChangefeedID
+	if len(manifest.Source.Tables) == 0 {
+		tableProvider := r.cfg.TableListProvider
+		if tableProvider == nil {
+			tableProvider = listTiDBTables
+		}
+		candidates, err := tableProvider(ctx, cfg.tidbConfig)
+		if err != nil {
+			return model.TaskManifest{}, err
+		}
+		resolved, err := filter.ResolveTables(manifest.Source.TableFilter, candidates)
+		if err != nil {
+			return model.TaskManifest{}, err
+		}
+		manifest.Source.Tables = make([]model.TableBinding, 0, len(resolved))
+		for _, table := range resolved {
+			manifest.Source.Tables = append(manifest.Source.Tables, model.TableBinding{
+				Database:       table.Database,
+				Table:          table.Table,
+				TargetDatabase: firstNonEmptyString(manifest.Sink.Database, tenantConfig.Sink.Database, r.cfg.DefaultSnowflake.Database),
+				TargetSchema:   firstNonEmptyString(manifest.Sink.Schema, tenantConfig.Sink.Schema, r.cfg.DefaultSnowflake.Schema),
+				TargetTable:    table.Table,
+			})
+		}
+	}
+	for i := range manifest.Source.Tables {
+		if manifest.Source.Tables[i].TargetDatabase == "" {
+			manifest.Source.Tables[i].TargetDatabase = firstNonEmptyString(manifest.Sink.Database, tenantConfig.Sink.Database, r.cfg.DefaultSnowflake.Database)
+		}
+		if manifest.Source.Tables[i].TargetSchema == "" {
+			manifest.Source.Tables[i].TargetSchema = firstNonEmptyString(manifest.Sink.Schema, tenantConfig.Sink.Schema, r.cfg.DefaultSnowflake.Schema)
+		}
+		if manifest.Source.Tables[i].TargetTable == "" {
+			manifest.Source.Tables[i].TargetTable = manifest.Source.Tables[i].Table
+		}
+	}
+	return manifest, nil
+}
+
 func (r *SnowflakeTaskRunner) StartTask(ctx context.Context, tenantConfig model.TenantConfig, manifest model.TaskManifest, store taskstore.Store) error {
 	cfg, err := r.buildConfig(tenantConfig, manifest)
 	if err != nil {
 		return err
+	}
+	if manifest.Status == model.TaskStatusPaused && cfg.mode != RunModeSnapshotOnly {
+		cdcConnector, err := newCDCConnectorForTask(cfg, nil)
+		if err != nil {
+			return err
+		}
+		if err := cdcConnector.ResumeChangefeed(); err != nil {
+			return err
+		}
 	}
 
 	taskKey := runnerTaskKey(tenantConfig.TenantID, manifest.TaskID)
@@ -131,6 +192,40 @@ func (r *SnowflakeTaskRunner) StopTask(_ context.Context, tenantConfig model.Ten
 	return nil
 }
 
+func (r *SnowflakeTaskRunner) PauseTask(ctx context.Context, tenantConfig model.TenantConfig, manifest model.TaskManifest) error {
+	cfg, err := r.buildConfig(tenantConfig, manifest)
+	if err != nil {
+		return err
+	}
+	if cfg.mode != RunModeSnapshotOnly {
+		cdcConnector, err := newCDCConnectorForTask(cfg, nil)
+		if err != nil {
+			return err
+		}
+		if err := cdcConnector.PauseChangefeed(); err != nil {
+			return err
+		}
+	}
+	return r.StopTask(ctx, tenantConfig, manifest.TaskID)
+}
+
+func (r *SnowflakeTaskRunner) DeleteTask(ctx context.Context, tenantConfig model.TenantConfig, manifest model.TaskManifest) error {
+	cfg, err := r.buildConfig(tenantConfig, manifest)
+	if err != nil {
+		return err
+	}
+	if cfg.mode != RunModeSnapshotOnly {
+		cdcConnector, err := newCDCConnectorForTask(cfg, nil)
+		if err != nil {
+			return err
+		}
+		if err := cdcConnector.DeleteChangefeed(); err != nil {
+			return err
+		}
+	}
+	return r.StopTask(ctx, tenantConfig, manifest.TaskID)
+}
+
 func (r *SnowflakeTaskRunner) forgetTask(taskKey string) {
 	r.mu.Lock()
 	delete(r.cancels, taskKey)
@@ -144,6 +239,12 @@ func (r *SnowflakeTaskRunner) buildConfig(tenantConfig model.TenantConfig, manif
 
 	tidbConfig := mergeTiDBConfig(r.cfg.DefaultTiDB, tenantConfig.Source.TiDB, manifest.Source.TiDB)
 	cdcConfig := mergeCDCConfig(r.cfg.DefaultCDC, tenantConfig.Source.CDC, manifest.Source.CDC)
+	if cdcConfig.Namespace == "" {
+		cdcConfig.Namespace = stableCDCName(tenantConfig.TenantID)
+	}
+	if cdcConfig.ChangefeedID == "" {
+		cdcConfig.ChangefeedID = stableChangefeedID(tenantConfig.TenantID, manifest.TaskID)
+	}
 	snowflakeConfig := mergeSnowflakeConfig(r.cfg.DefaultSnowflake, tenantConfig.Sink, manifest.Sink)
 	storageRoot := firstNonEmptyString(manifest.Storage.URI, tenantConfig.StorageURI)
 	awsCredentials, err := mergeAWSCredentials(r.cfg.DefaultAWSCredentials, tenantConfig.StorageCredentials, storageRoot)
@@ -307,7 +408,12 @@ func (r *SnowflakeTaskRunner) runSnowflakeTask(ctx context.Context, cfg snowflak
 	defer closeConnectors(snapConnectorMap)
 	defer closeConnectors(increConnectorMap)
 
-	return ReplicateWithContext(
+	columnSelectors, err := buildCDCColumnSelectors(ctx, cfg)
+	if err != nil {
+		return err
+	}
+
+	return ReplicateWithCDCConfig(
 		ctx,
 		&cfg.tidbConfig,
 		cfg.tables,
@@ -324,7 +430,92 @@ func (r *SnowflakeTaskRunner) runSnowflakeTask(ctx context.Context, cfg snowflak
 		"snowflake",
 		true,
 		cfg.mode,
+		CDCExportConfig{
+			Namespace:       cfg.cdcConfig.Namespace,
+			ChangefeedID:    cfg.cdcConfig.ChangefeedID,
+			ColumnSelectors: columnSelectors,
+		},
 	)
+}
+
+func listTiDBTables(ctx context.Context, tidbConfig tidbsql.TiDBConfig) ([]model.TableName, error) {
+	db, err := tidbConfig.OpenDB()
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+	_ = ctx
+	return tidbsql.ListTiDBTables(db)
+}
+
+func newCDCConnectorForTask(cfg snowflakeTaskConfig, columnSelectors []cdc.ColumnSelector) (*cdc.CDCConnector, error) {
+	_, incrementURI, err := genSnapshotAndIncrementURIs(cfg.storageURI)
+	if err != nil {
+		return nil, err
+	}
+	return cdc.NewCDCConnectorWithOptions(
+		cfg.cdcConfig.Host,
+		cfg.cdcConfig.Port,
+		cfg.tables,
+		0,
+		incrementURI,
+		cfg.cdcFlushInterval,
+		cfg.cdcFileSize,
+		CdcCsvBinaryEncodingMethodMap["snowflake"],
+		cdc.CDCConnectorOptions{
+			Namespace:       cfg.cdcConfig.Namespace,
+			ChangefeedID:    cfg.cdcConfig.ChangefeedID,
+			ColumnSelectors: columnSelectors,
+		},
+	)
+}
+
+func buildCDCColumnSelectors(ctx context.Context, cfg snowflakeTaskConfig) ([]cdc.ColumnSelector, error) {
+	needsProjection := false
+	for _, binding := range cfg.bindings {
+		if binding.ColumnFilter.Mode != "" {
+			needsProjection = true
+			break
+		}
+	}
+	if !needsProjection {
+		return nil, nil
+	}
+
+	db, err := cfg.tidbConfig.OpenDB()
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+
+	selectors := make([]cdc.ColumnSelector, 0, len(cfg.bindings))
+	for _, binding := range cfg.bindings {
+		if binding.ColumnFilter.Mode == "" {
+			continue
+		}
+		columns, err := tidbsql.GetTiDBTableColumn(db, binding.Database, binding.Table)
+		if err != nil {
+			return nil, err
+		}
+		pkColumns, err := tidbsql.GetTiDBTablePKColumns(db, binding.Database, binding.Table)
+		if err != nil {
+			return nil, err
+		}
+		projected, _, err := snowsql.ProjectSnowflakeColumns(columns, binding.ColumnFilter, pkColumns)
+		if err != nil {
+			return nil, err
+		}
+		columnNames := make([]string, 0, len(projected))
+		for _, column := range projected {
+			columnNames = append(columnNames, column.Name)
+		}
+		selectors = append(selectors, cdc.ColumnSelector{
+			Matcher: []string{fmt.Sprintf("%s.%s", binding.Database, binding.Table)},
+			Columns: columnNames,
+		})
+	}
+	_ = ctx
+	return selectors, nil
 }
 
 func buildTaskStorageURI(storageRoot string, taskID string, cred credentials.Value) (*url.URL, error) {
@@ -401,11 +592,23 @@ func mergeCDCConfig(base model.SourceCDCConfig, tenant model.SourceCDCConfig, ta
 	if tenant.Port != 0 {
 		cfg.Port = tenant.Port
 	}
+	if tenant.Namespace != "" {
+		cfg.Namespace = tenant.Namespace
+	}
+	if tenant.ChangefeedID != "" {
+		cfg.ChangefeedID = tenant.ChangefeedID
+	}
 	if task.Host != "" {
 		cfg.Host = task.Host
 	}
 	if task.Port != 0 {
 		cfg.Port = task.Port
+	}
+	if task.Namespace != "" {
+		cfg.Namespace = task.Namespace
+	}
+	if task.ChangefeedID != "" {
+		cfg.ChangefeedID = task.ChangefeedID
 	}
 	return cfg
 }
@@ -503,6 +706,40 @@ func closeConnectors(connectors map[string]coreinterfaces.Connector) {
 
 func runnerTaskKey(tenantID, taskID string) string {
 	return tenantID + "/" + taskID
+}
+
+func stableChangefeedID(tenantID, taskID string) string {
+	base := "tidb2dw-" + stableCDCName(tenantID) + "-" + stableCDCName(taskID)
+	if len(base) <= 128 {
+		return base
+	}
+	sum := sha1.Sum([]byte(base))
+	suffix := hex.EncodeToString(sum[:])[:12]
+	prefix := strings.TrimRight(base[:128-len(suffix)-1], "-")
+	return prefix + "-" + suffix
+}
+
+func stableCDCName(value string) string {
+	value = strings.ToLower(value)
+	var sb strings.Builder
+	previousHyphen := false
+	for _, r := range value {
+		isAlnum := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')
+		if isAlnum {
+			sb.WriteRune(r)
+			previousHyphen = false
+			continue
+		}
+		if !previousHyphen {
+			sb.WriteByte('-')
+			previousHyphen = true
+		}
+	}
+	result := strings.Trim(sb.String(), "-")
+	if result == "" {
+		return "default"
+	}
+	return result
 }
 
 func firstNonZeroInt(values ...int) int {

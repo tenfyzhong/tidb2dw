@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/pingcap-inc/tidb2dw/pkg/model"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/dumpling/export"
 	"github.com/pingcap/tiflow/pkg/sink/cloudstorage"
@@ -113,7 +114,7 @@ func GetColumnDiff(prev []cloudstorage.TableCol, curr []cloudstorage.TableCol) (
 }
 
 func GetTiDBTableColumn(db *sql.DB, sourceDatabase, sourceTable string) ([]cloudstorage.TableCol, error) {
-	columnQuery := fmt.Sprintf(`SELECT COLUMN_NAME, COLUMN_DEFAULT, IS_NULLABLE, DATA_TYPE, 
+	columnQuery := fmt.Sprintf(`SELECT COLUMN_NAME, COLUMN_DEFAULT, IS_NULLABLE, DATA_TYPE,
 CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE, DATETIME_PRECISION, COLUMN_TYPE, EXTRA
 FROM information_schema.columns
 WHERE table_schema = "%s" AND table_name = "%s"`, sourceDatabase, sourceTable) // FIXME: Escape
@@ -219,4 +220,28 @@ func GetTiDBTablePKColumns(db *sql.DB, sourceDatabase, sourceTable string) ([]st
 		}
 	}
 	return pkColumns, nil
+}
+
+func ListTiDBTables(db *sql.DB) ([]model.TableName, error) {
+	rows, err := db.Query(`SELECT TABLE_SCHEMA, TABLE_NAME
+FROM information_schema.tables
+WHERE TABLE_TYPE = 'BASE TABLE'
+ORDER BY TABLE_SCHEMA, TABLE_NAME`)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	defer rows.Close()
+
+	tables := make([]model.TableName, 0)
+	for rows.Next() {
+		var table model.TableName
+		if err := rows.Scan(&table.Database, &table.Table); err != nil {
+			return nil, errors.Trace(err)
+		}
+		tables = append(tables, table)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, errors.Trace(err)
+	}
+	return tables, nil
 }
