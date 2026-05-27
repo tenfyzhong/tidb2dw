@@ -19,6 +19,7 @@ func NewS3Cmd() *cobra.Command {
 		tidbConfigFromCli   tidbsql.TiDBConfig
 		tables              []string
 		snapshotConcurrency int
+		tableConcurrency    int
 		storagePath         string
 		cdcHost             string
 		cdcPort             int
@@ -77,7 +78,7 @@ func NewS3Cmd() *cobra.Command {
 				return errors.Trace(err)
 			}
 			return ExportTablesSeparately(context.Background(), &tidbConfigFromCli, tables, storageURI,
-				snapshotConcurrency, cdcHost, cdcPort, cdcFlushInterval, cdcFileSize, csvOutputDialect, mode)
+				snapshotConcurrency, tableConcurrency, cdcHost, cdcPort, cdcFlushInterval, cdcFileSize, csvOutputDialect, mode)
 		}
 
 		return Export(context.Background(), &tidbConfigFromCli, tables, storageURI, snapshotURI,
@@ -106,6 +107,7 @@ func NewS3Cmd() *cobra.Command {
 	cmd.Flags().StringVar(&sysbenchTablePrefix, "sysbench.table-prefix", "sbtest", "sysbench table prefix")
 	cmd.Flags().IntVar(&sysbenchTableCount, "sysbench.tables", 0, "number of sysbench tables; generates <database>.<prefix>1 through <database>.<prefix>N")
 	cmd.Flags().IntVar(&snapshotConcurrency, "snapshot-concurrency", 8, "the number of concurrent snapshot workers")
+	cmd.Flags().IntVar(&tableConcurrency, "table-concurrency", DefaultTableConcurrency, "the number of concurrent table workers")
 	cmd.Flags().StringVarP(&storagePath, "storage", "s", "", "storage path: s3://<bucket>/<path> or gcs://<bucket>/<path>")
 	cmd.Flags().StringVar(&csvOutputDialect, "csv-output-dialect", "", "csv output dialect: default, redshift, snowflake, bigquery")
 	cmd.Flags().StringVar(&cdcHost, "cdc.host", "127.0.0.1", "TiCDC server host")

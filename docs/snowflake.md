@@ -40,12 +40,18 @@ stage:
     --storage s3://my-demo-bucket/prefix \
     --sysbench.database sbtest \
     --sysbench.tables 1000 \
+    --table-concurrency 64 \
     --snowflake.account-id <organization>-<account> \
     --snowflake.user <username> \
     --snowflake.pass <password> \
     --snowflake.database <database> \
     --snowflake.schema <schema>
 ```
+
+`--table-concurrency` controls how many table-level workers run at the same
+time. For sysbench runs with 1000 tables, increase it to raise TiDB, TiCDC, S3,
+and Snowflake load. Keep `--snapshot-concurrency` in mind because it applies per
+table.
 
 ## Supported DDL Operations
 

@@ -1,7 +1,9 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws/credentials"
@@ -24,6 +26,7 @@ func NewSnowflakeCmd() *cobra.Command {
 		snowflakeConfigFromCli snowsql.SnowflakeConfig
 		tables                 []string
 		snapshotConcurrency    int
+		tableConcurrency       int
 		storagePath            string
 		cdcHost                string
 		cdcPort                int
@@ -89,9 +92,28 @@ func NewSnowflakeCmd() *cobra.Command {
 			return errors.Trace(err)
 		}
 
+		if useTableScopedStorage {
+			if err := ExportTablesSeparately(context.Background(), &tidbConfigFromCli, tables, storageURI,
+				snapshotConcurrency, tableConcurrency, cdcHost, cdcPort, cdcFlushInterval, cdcFileSize, "snowflake", mode); err != nil {
+				return errors.Trace(err)
+			}
+		}
+
 		snapConnectorMap := make(map[string]coreinterfaces.Connector)
 		increConnectorMap := make(map[string]coreinterfaces.Connector)
-		for _, tableFQN := range tables {
+		var connectorMu sync.Mutex
+		closeConnectors := func() {
+			connectorMu.Lock()
+			defer connectorMu.Unlock()
+			for _, connector := range snapConnectorMap {
+				connector.Close()
+			}
+			for _, connector := range increConnectorMap {
+				connector.Close()
+			}
+		}
+
+		if err := runTableWorkers(tables, tableConcurrency, func(tableFQN string) error {
 			sourceDatabase, sourceTable := utils.SplitTableFQN(tableFQN)
 			tableSnapshotURI := snapshotURI
 			tableIncrementURI := incrementURI
@@ -112,7 +134,6 @@ func NewSnowflakeCmd() *cobra.Command {
 			if err != nil {
 				return errors.Trace(err)
 			}
-			snapConnectorMap[tableFQN] = snapConnector
 			increConnector, err := snowsql.NewSnowflakeConnector(
 				&snowflakeConfigFromCli,
 				fmt.Sprintf("increment_external_%s_%s", sourceDatabase, sourceTable),
@@ -120,25 +141,25 @@ func NewSnowflakeCmd() *cobra.Command {
 				credValue,
 			)
 			if err != nil {
+				snapConnector.Close()
 				return errors.Trace(err)
 			}
+
+			connectorMu.Lock()
+			snapConnectorMap[tableFQN] = snapConnector
 			increConnectorMap[tableFQN] = increConnector
+			connectorMu.Unlock()
+			return nil
+		}); err != nil {
+			closeConnectors()
+			return errors.Trace(err)
 		}
 
-		defer func() {
-			for _, connector := range snapConnectorMap {
-				connector.Close()
-			}
-			for _, connector := range increConnectorMap {
-				connector.Close()
-			}
-		}()
+		defer closeConnectors()
 
 		if useTableScopedStorage {
-			return ReplicateTablesSeparately(&tidbConfigFromCli, tables, storageURI,
-				snapshotConcurrency, cdcHost, cdcPort, cdcFlushInterval, cdcFileSize,
-				snapConnectorMap, increConnectorMap, "snowflake", true, mode,
-			)
+			return LoadTablesSeparately(&tidbConfigFromCli, tables, storageURI, cdcFlushInterval,
+				snapConnectorMap, increConnectorMap, true, mode)
 		}
 
 		return Replicate(&tidbConfigFromCli, tables, storageURI, snapshotURI, incrementURI,
@@ -182,6 +203,7 @@ func NewSnowflakeCmd() *cobra.Command {
 	cmd.Flags().StringVar(&sysbenchTablePrefix, "sysbench.table-prefix", "sbtest", "sysbench table prefix")
 	cmd.Flags().IntVar(&sysbenchTableCount, "sysbench.tables", 0, "number of sysbench tables; generates <database>.<prefix>1 through <database>.<prefix>N")
 	cmd.Flags().IntVar(&snapshotConcurrency, "snapshot-concurrency", 8, "the number of concurrent snapshot workers")
+	cmd.Flags().IntVar(&tableConcurrency, "table-concurrency", DefaultTableConcurrency, "the number of concurrent table workers")
 	cmd.Flags().StringVarP(&storagePath, "storage", "s", "", "storage path: s3://<bucket>/<path> or gcs://<bucket>/<path>")
 	cmd.Flags().StringVar(&cdcHost, "cdc.host", "127.0.0.1", "TiCDC server host")
 	cmd.Flags().IntVar(&cdcPort, "cdc.port", 8300, "TiCDC server port")

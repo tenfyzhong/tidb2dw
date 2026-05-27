@@ -190,6 +190,7 @@ func ExportTablesSeparately(
 	tables []string,
 	storageURI *url.URL,
 	snapshotConcurrency int,
+	tableConcurrency int,
 	cdcHost string,
 	cdcPort int,
 	cdcFlushInterval time.Duration,
@@ -202,17 +203,14 @@ func ExportTablesSeparately(
 		return errors.Trace(err)
 	}
 
-	for _, table := range tables {
+	return runTableWorkers(tables, tableConcurrency, func(table string) error {
 		tableURIs, err := genTableScopedReplicationURIs(storageURI, table)
 		if err != nil {
 			return errors.Trace(err)
 		}
-		if err := exportToStorage(ctx, tidbConfig, []string{table}, tableURIs.storageURI, tableURIs.snapshotURI, tableURIs.incrementURI,
-			snapshotConcurrency, cdcHost, cdcPort, cdcFlushInterval, cdcFileSize, csvOutputDialect, mode, startTSO); err != nil {
-			return errors.Trace(err)
-		}
-	}
-	return nil
+		return exportToStorage(ctx, tidbConfig, []string{table}, tableURIs.storageURI, tableURIs.snapshotURI, tableURIs.incrementURI,
+			snapshotConcurrency, cdcHost, cdcPort, cdcFlushInterval, cdcFileSize, csvOutputDialect, mode, startTSO)
+	})
 }
 
 func getExportStartTSO(tidbConfig *tidbsql.TiDBConfig, mode RunMode) (uint64, error) {
@@ -358,6 +356,7 @@ func ReplicateTablesSeparately(
 	tables []string,
 	storageURI *url.URL,
 	snapshotConcurrency int,
+	tableConcurrency int,
 	cdcHost string,
 	cdcPort int,
 	cdcFlushInterval time.Duration,
@@ -370,11 +369,26 @@ func ReplicateTablesSeparately(
 ) error {
 	ctx := context.Background()
 	metrics.TableNumGauge.Add(float64(len(tables)))
-	if err := ExportTablesSeparately(ctx, tidbConfig, tables, storageURI, snapshotConcurrency,
+	if err := ExportTablesSeparately(ctx, tidbConfig, tables, storageURI, snapshotConcurrency, tableConcurrency,
 		cdcHost, cdcPort, cdcFlushInterval, cdcFileSize, csvOutputDialect, mode); err != nil {
 		return errors.Trace(err)
 	}
 
+	return LoadTablesSeparately(tidbConfig, tables, storageURI, cdcFlushInterval,
+		snapConnectorMap, increConnectorMap, parrallelLoad, mode)
+}
+
+func LoadTablesSeparately(
+	tidbConfig *tidbsql.TiDBConfig,
+	tables []string,
+	storageURI *url.URL,
+	cdcFlushInterval time.Duration,
+	snapConnectorMap map[string]coreinterfaces.Connector,
+	increConnectorMap map[string]coreinterfaces.Connector,
+	parrallelLoad bool,
+	mode RunMode,
+) error {
+	ctx := context.Background()
 	onError := func(table string, err error) {
 		apiservice.GlobalInstance.APIInfo.SetTableFatalError(table, err)
 		metrics.AddCounter(metrics.ErrorCounter, 1, table)
