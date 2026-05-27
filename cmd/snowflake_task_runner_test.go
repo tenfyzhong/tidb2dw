@@ -136,6 +136,105 @@ func TestSnowflakeTaskRunnerPreparesTaskByResolvingTableFilter(t *testing.T) {
 	require.Equal(t, "tidb2dw-tenant-a-orders-to-snowflake", manifest.Source.CDC.ChangefeedID)
 }
 
+func TestSnowflakeTaskRunnerBuildConfigMapsAllTaskModes(t *testing.T) {
+	runner := NewSnowflakeTaskRunner(SnowflakeTaskRunnerConfig{
+		DefaultTiDB:           tidbsql.TiDBConfig{Host: "tidb", Port: 4000, User: "root"},
+		DefaultCDC:            model.SourceCDCConfig{Host: "ticdc", Port: 8300},
+		DefaultSnowflake:      snowsql.SnowflakeConfig{AccountId: "acct", Warehouse: "wh", User: "u", Pass: "p", Database: "ANALYTICS", Schema: "TENANT_A"},
+		DefaultAWSCredentials: credentials.Value{AccessKeyID: "ak", SecretAccessKey: "sk"},
+	})
+	tenantConfig := model.TenantConfig{
+		TenantID:   "tenant-a",
+		Keyspace:   "keyspace_a",
+		StorageURI: "s3://company-replication/tenants/tenant-a",
+	}
+	cases := []struct {
+		name string
+		mode model.TaskMode
+		want RunMode
+	}{
+		{name: "default", want: RunModeFull},
+		{name: "full", mode: model.TaskModeFull, want: RunModeFull},
+		{name: "snapshot-only", mode: model.TaskModeSnapshotOnly, want: RunModeSnapshotOnly},
+		{name: "incremental-only", mode: model.TaskModeIncrementalOnly, want: RunModeIncrementalOnly},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := runner.buildConfig(tenantConfig, model.TaskManifest{
+				Version:  1,
+				TenantID: "tenant-a",
+				Keyspace: "keyspace_a",
+				TaskID:   "orders-to-snowflake",
+				Mode:     tc.mode,
+				Source: model.TaskSource{
+					Tables: []model.TableBinding{{Database: "orders", Table: "orders"}},
+				},
+				Storage: model.StorageConfig{URI: "s3://company-replication/tenants/tenant-a"},
+				Sink:    model.SinkConfig{Type: model.SinkTypeSnowflake, Database: "ANALYTICS", Schema: "TENANT_A"},
+			})
+			require.NoError(t, err)
+			require.Equal(t, tc.want, cfg.mode)
+		})
+	}
+}
+
+func TestSnowflakeTaskRunnerValidatesSnapshotOnlyWithoutCDCConfig(t *testing.T) {
+	ctx := context.Background()
+	runner := NewSnowflakeTaskRunner(SnowflakeTaskRunnerConfig{
+		DefaultTiDB:           tidbsql.TiDBConfig{Host: "127.0.0.1", Port: 1, User: "root"},
+		DefaultSnowflake:      snowsql.SnowflakeConfig{AccountId: "acct", Warehouse: "wh", User: "u", Pass: "p", Database: "ANALYTICS", Schema: "TENANT_A"},
+		DefaultAWSCredentials: credentials.Value{AccessKeyID: "ak", SecretAccessKey: "sk"},
+	})
+
+	err := runner.ValidateTask(ctx, model.TenantConfig{
+		TenantID:   "tenant-a",
+		Keyspace:   "keyspace_a",
+		StorageURI: "s3://company-replication/tenants/tenant-a",
+	}, model.TaskManifest{
+		Version:  1,
+		TenantID: "tenant-a",
+		Keyspace: "keyspace_a",
+		TaskID:   "snapshot-only",
+		Mode:     model.TaskModeSnapshotOnly,
+		Source: model.TaskSource{
+			Tables: []model.TableBinding{{Database: "orders", Table: "orders"}},
+		},
+		Storage: model.StorageConfig{URI: "s3://company-replication/tenants/tenant-a"},
+		Sink:    model.SinkConfig{Type: model.SinkTypeSnowflake, Database: "ANALYTICS", Schema: "TENANT_A"},
+	})
+
+	require.Error(t, err)
+	require.NotContains(t, err.Error(), "cdc host")
+}
+
+func TestSnowflakeTaskRunnerValidatesIncrementalOnlyWithoutTiDBConfig(t *testing.T) {
+	ctx := context.Background()
+	runner := NewSnowflakeTaskRunner(SnowflakeTaskRunnerConfig{
+		DefaultCDC:            model.SourceCDCConfig{Host: "ticdc", Port: 8300},
+		DefaultSnowflake:      snowsql.SnowflakeConfig{AccountId: "acct", Warehouse: "wh", User: "u", Pass: "p", Database: "ANALYTICS", Schema: "TENANT_A"},
+		DefaultAWSCredentials: credentials.Value{AccessKeyID: "ak", SecretAccessKey: "sk"},
+	})
+
+	err := runner.ValidateTask(ctx, model.TenantConfig{
+		TenantID:   "tenant-a",
+		Keyspace:   "keyspace_a",
+		StorageURI: "s3://company-replication/tenants/tenant-a",
+	}, model.TaskManifest{
+		Version:  1,
+		TenantID: "tenant-a",
+		Keyspace: "keyspace_a",
+		TaskID:   "incremental-only",
+		Mode:     model.TaskModeIncrementalOnly,
+		Source: model.TaskSource{
+			Tables: []model.TableBinding{{Database: "orders", Table: "orders"}},
+		},
+		Storage: model.StorageConfig{URI: "s3://company-replication/tenants/tenant-a"},
+		Sink:    model.SinkConfig{Type: model.SinkTypeSnowflake, Database: "ANALYTICS", Schema: "TENANT_A"},
+	})
+
+	require.NoError(t, err)
+}
+
 func TestSnowflakeTaskRunnerStopCancelsRunningTask(t *testing.T) {
 	ctx := context.Background()
 	store := taskstore.NewMemoryStore(model.TenantConfig{

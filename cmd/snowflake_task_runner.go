@@ -317,15 +317,20 @@ func (r *SnowflakeTaskRunner) buildConfig(tenantConfig model.TenantConfig, manif
 }
 
 func (r *SnowflakeTaskRunner) validateSnowflakeTask(ctx context.Context, cfg snowflakeTaskConfig) error {
-	if cfg.tidbConfig.Host == "" || cfg.tidbConfig.Port == 0 || cfg.tidbConfig.User == "" {
+	_ = ctx
+
+	if snowflakeTaskNeedsTiDB(cfg) && (cfg.tidbConfig.Host == "" || cfg.tidbConfig.Port == 0 || cfg.tidbConfig.User == "") {
 		return fmt.Errorf("tidb host, port, and user must be configured")
 	}
-	if cfg.cdcConfig.Host == "" || cfg.cdcConfig.Port == 0 {
+	if snowflakeTaskNeedsCDC(cfg.mode) && (cfg.cdcConfig.Host == "" || cfg.cdcConfig.Port == 0) {
 		return fmt.Errorf("cdc host and port must be configured")
 	}
 	if cfg.snowflakeConfig.AccountId == "" || cfg.snowflakeConfig.Warehouse == "" || cfg.snowflakeConfig.User == "" ||
 		cfg.snowflakeConfig.Pass == "" {
 		return fmt.Errorf("snowflake account_id, warehouse, user, and pass must be configured")
+	}
+	if !snowflakeTaskNeedsTiDB(cfg) {
+		return nil
 	}
 
 	db, err := cfg.tidbConfig.OpenDB()
@@ -355,7 +360,6 @@ func (r *SnowflakeTaskRunner) validateSnowflakeTask(ctx context.Context, cfg sno
 			}
 		}
 	}
-	_ = ctx
 	return nil
 }
 
@@ -408,9 +412,12 @@ func (r *SnowflakeTaskRunner) runSnowflakeTask(ctx context.Context, cfg snowflak
 	defer closeConnectors(snapConnectorMap)
 	defer closeConnectors(increConnectorMap)
 
-	columnSelectors, err := buildCDCColumnSelectors(ctx, cfg)
-	if err != nil {
-		return err
+	var columnSelectors []cdc.ColumnSelector
+	if snowflakeTaskNeedsCDC(cfg.mode) {
+		columnSelectors, err = buildCDCColumnSelectors(ctx, cfg)
+		if err != nil {
+			return err
+		}
 	}
 
 	return ReplicateWithCDCConfig(
@@ -683,6 +690,23 @@ func taskModeToRunMode(mode model.TaskMode) (RunMode, error) {
 	default:
 		return RunModeFull, fmt.Errorf("unsupported task mode %q", mode)
 	}
+}
+
+func snowflakeTaskNeedsTiDB(cfg snowflakeTaskConfig) bool {
+	switch cfg.mode {
+	case RunModeFull, RunModeSnapshotOnly:
+		return true
+	}
+	for _, binding := range cfg.bindings {
+		if binding.ColumnFilter.Mode != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func snowflakeTaskNeedsCDC(mode RunMode) bool {
+	return mode == RunModeFull || mode == RunModeIncrementalOnly
 }
 
 func safeStageName(parts ...string) string {
