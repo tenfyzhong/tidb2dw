@@ -36,9 +36,12 @@ func NewSnowflakeCmd() *cobra.Command {
 		awsSecretKey           string
 		credValue              *credentials.Value
 
-		mode          RunMode
-		apiListenHost string
-		apiListenPort int
+		mode                RunMode
+		apiListenHost       string
+		apiListenPort       int
+		sysbenchDatabase    string
+		sysbenchTablePrefix string
+		sysbenchTableCount  int
 	)
 
 	run := func() error {
@@ -67,6 +70,20 @@ func NewSnowflakeCmd() *cobra.Command {
 			return errors.Trace(err)
 		}
 
+		useTableScopedStorage := false
+		if sysbenchTableCount > 0 {
+			if len(tables) > 0 {
+				return errors.New("use either --table or --sysbench.tables, not both")
+			}
+			tables, err = buildSysbenchTables(sysbenchDatabase, sysbenchTablePrefix, sysbenchTableCount)
+			if err != nil {
+				return errors.Trace(err)
+			}
+			useTableScopedStorage = true
+		} else if len(tables) > 1 {
+			useTableScopedStorage = true
+		}
+
 		snapshotURI, incrementURI, err := genSnapshotAndIncrementURIs(storageURI)
 		if err != nil {
 			return errors.Trace(err)
@@ -76,10 +93,20 @@ func NewSnowflakeCmd() *cobra.Command {
 		increConnectorMap := make(map[string]coreinterfaces.Connector)
 		for _, tableFQN := range tables {
 			sourceDatabase, sourceTable := utils.SplitTableFQN(tableFQN)
+			tableSnapshotURI := snapshotURI
+			tableIncrementURI := incrementURI
+			if useTableScopedStorage {
+				tableURIs, err := genTableScopedReplicationURIs(storageURI, tableFQN)
+				if err != nil {
+					return errors.Trace(err)
+				}
+				tableSnapshotURI = tableURIs.snapshotURI
+				tableIncrementURI = tableURIs.incrementURI
+			}
 			snapConnector, err := snowsql.NewSnowflakeConnector(
 				&snowflakeConfigFromCli,
 				fmt.Sprintf("snapshot_external_%s_%s", sourceDatabase, sourceTable),
-				snapshotURI,
+				tableSnapshotURI,
 				credValue,
 			)
 			if err != nil {
@@ -89,7 +116,7 @@ func NewSnowflakeCmd() *cobra.Command {
 			increConnector, err := snowsql.NewSnowflakeConnector(
 				&snowflakeConfigFromCli,
 				fmt.Sprintf("increment_external_%s_%s", sourceDatabase, sourceTable),
-				incrementURI,
+				tableIncrementURI,
 				credValue,
 			)
 			if err != nil {
@@ -106,6 +133,13 @@ func NewSnowflakeCmd() *cobra.Command {
 				connector.Close()
 			}
 		}()
+
+		if useTableScopedStorage {
+			return ReplicateTablesSeparately(&tidbConfigFromCli, tables, storageURI,
+				snapshotConcurrency, cdcHost, cdcPort, cdcFlushInterval, cdcFileSize,
+				snapConnectorMap, increConnectorMap, "snowflake", true, mode,
+			)
+		}
 
 		return Replicate(&tidbConfigFromCli, tables, storageURI, snapshotURI, incrementURI,
 			snapshotConcurrency, cdcHost, cdcPort, cdcFlushInterval, cdcFileSize,
@@ -144,6 +178,9 @@ func NewSnowflakeCmd() *cobra.Command {
 	cmd.Flags().StringVar(&snowflakeConfigFromCli.Database, "snowflake.database", "", "snowflake database")
 	cmd.Flags().StringVar(&snowflakeConfigFromCli.Schema, "snowflake.schema", "", "snowflake schema")
 	cmd.Flags().StringArrayVarP(&tables, "table", "t", []string{}, "tables full qualified name, e.g. -t <db1>.<table1> -t <db2>.<table2>")
+	cmd.Flags().StringVar(&sysbenchDatabase, "sysbench.database", "", "sysbench database name, e.g. sbtest from --mysql-db=sbtest")
+	cmd.Flags().StringVar(&sysbenchTablePrefix, "sysbench.table-prefix", "sbtest", "sysbench table prefix")
+	cmd.Flags().IntVar(&sysbenchTableCount, "sysbench.tables", 0, "number of sysbench tables; generates <database>.<prefix>1 through <database>.<prefix>N")
 	cmd.Flags().IntVar(&snapshotConcurrency, "snapshot-concurrency", 8, "the number of concurrent snapshot workers")
 	cmd.Flags().StringVarP(&storagePath, "storage", "s", "", "storage path: s3://<bucket>/<path> or gcs://<bucket>/<path>")
 	cmd.Flags().StringVar(&cdcHost, "cdc.host", "127.0.0.1", "TiCDC server host")

@@ -79,3 +79,28 @@ func TestGenTableScopedStorageURI(t *testing.T) {
 		t.Fatalf("base URI was mutated: %s", baseURI.String())
 	}
 }
+
+func TestGenTableScopedReplicationURIs(t *testing.T) {
+	baseURI, err := url.Parse("s3://example-bucket/export-root?access-key=ak&secret-access-key=sk")
+	if err != nil {
+		t.Fatalf("parse base URI: %v", err)
+	}
+
+	got, err := genTableScopedReplicationURIs(baseURI, "sbtest.sbtest1")
+	if err != nil {
+		t.Fatalf("genTableScopedReplicationURIs returned error: %v", err)
+	}
+
+	expectedStorageURI := "s3://example-bucket/export-root/sbtest.sbtest1?access-key=ak&secret-access-key=sk"
+	if got.storageURI.String() != expectedStorageURI {
+		t.Fatalf("storage URI = %s, want %s", got.storageURI.String(), expectedStorageURI)
+	}
+	expectedSnapshotURI := "s3://example-bucket/export-root/sbtest.sbtest1/snapshot?access-key=ak&secret-access-key=sk"
+	if got.snapshotURI.String() != expectedSnapshotURI {
+		t.Fatalf("snapshot URI = %s, want %s", got.snapshotURI.String(), expectedSnapshotURI)
+	}
+	expectedIncrementURI := "s3://example-bucket/export-root/sbtest.sbtest1/increment?access-key=ak&secret-access-key=sk"
+	if got.incrementURI.String() != expectedIncrementURI {
+		t.Fatalf("increment URI = %s, want %s", got.incrementURI.String(), expectedIncrementURI)
+	}
+}

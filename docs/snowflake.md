@@ -26,6 +26,27 @@ export AWS_SESSION_TOKEN=<SESSION_TOKEN>  # Optional
 # Use --help for details.
 ```
 
+For sysbench multi-table tests, sysbench creates tables named
+`<table-prefix>1` through `<table-prefix>N` in the database passed by
+`--mysql-db`. For example, `--mysql-db=sbtest --tables=1000` creates
+`sbtest1` through `sbtest1000`.
+
+Use `--sysbench.tables` to let tidb2dw generate these table names. In this
+mode, each table is replicated through its own S3 prefix and Snowflake external
+stage:
+
+```shell
+./tidb2dw snowflake \
+    --storage s3://my-demo-bucket/prefix \
+    --sysbench.database sbtest \
+    --sysbench.tables 1000 \
+    --snowflake.account-id <organization>-<account> \
+    --snowflake.user <username> \
+    --snowflake.pass <password> \
+    --snowflake.database <database> \
+    --snowflake.schema <schema>
+```
+
 ## Supported DDL Operations
 
 All DDL which will change the schema of table are supported (except index related), including:

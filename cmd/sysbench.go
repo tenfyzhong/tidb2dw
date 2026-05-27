@@ -8,6 +8,12 @@ import (
 	"github.com/pingcap/errors"
 )
 
+type tableScopedReplicationURIs struct {
+	storageURI   *url.URL
+	snapshotURI  *url.URL
+	incrementURI *url.URL
+}
+
 func buildSysbenchTables(database, tablePrefix string, tableCount int) ([]string, error) {
 	database = strings.TrimSpace(database)
 	tablePrefix = strings.TrimSpace(tablePrefix)
@@ -44,4 +50,20 @@ func genTableScopedStorageURI(storageURI *url.URL, tableFQN string) (*url.URL, e
 	}
 	tableStorageURI.Path = tablePath
 	return &tableStorageURI, nil
+}
+
+func genTableScopedReplicationURIs(storageURI *url.URL, tableFQN string) (*tableScopedReplicationURIs, error) {
+	tableStorageURI, err := genTableScopedStorageURI(storageURI, tableFQN)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	snapshotURI, incrementURI, err := genSnapshotAndIncrementURIs(tableStorageURI)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	return &tableScopedReplicationURIs{
+		storageURI:   tableStorageURI,
+		snapshotURI:  snapshotURI,
+		incrementURI: incrementURI,
+	}, nil
 }

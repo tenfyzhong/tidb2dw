@@ -203,15 +203,11 @@ func ExportTablesSeparately(
 	}
 
 	for _, table := range tables {
-		tableStorageURI, err := genTableScopedStorageURI(storageURI, table)
+		tableURIs, err := genTableScopedReplicationURIs(storageURI, table)
 		if err != nil {
 			return errors.Trace(err)
 		}
-		snapshotURI, incrementURI, err := genSnapshotAndIncrementURIs(tableStorageURI)
-		if err != nil {
-			return errors.Trace(err)
-		}
-		if err := exportToStorage(ctx, tidbConfig, []string{table}, tableStorageURI, snapshotURI, incrementURI,
+		if err := exportToStorage(ctx, tidbConfig, []string{table}, tableURIs.storageURI, tableURIs.snapshotURI, tableURIs.incrementURI,
 			snapshotConcurrency, cdcHost, cdcPort, cdcFlushInterval, cdcFileSize, csvOutputDialect, mode, startTSO); err != nil {
 			return errors.Trace(err)
 		}
@@ -351,6 +347,76 @@ func Replicate(
 			}
 			apiservice.GlobalInstance.APIInfo.SetTableStage(table, apiservice.TableStageFinished)
 		}(table)
+	}
+
+	wg.Wait()
+	return nil
+}
+
+func ReplicateTablesSeparately(
+	tidbConfig *tidbsql.TiDBConfig,
+	tables []string,
+	storageURI *url.URL,
+	snapshotConcurrency int,
+	cdcHost string,
+	cdcPort int,
+	cdcFlushInterval time.Duration,
+	cdcFileSize int,
+	snapConnectorMap map[string]coreinterfaces.Connector,
+	increConnectorMap map[string]coreinterfaces.Connector,
+	csvOutputDialect string,
+	parrallelLoad bool,
+	mode RunMode,
+) error {
+	ctx := context.Background()
+	metrics.TableNumGauge.Add(float64(len(tables)))
+	if err := ExportTablesSeparately(ctx, tidbConfig, tables, storageURI, snapshotConcurrency,
+		cdcHost, cdcPort, cdcFlushInterval, cdcFileSize, csvOutputDialect, mode); err != nil {
+		return errors.Trace(err)
+	}
+
+	onError := func(table string, err error) {
+		apiservice.GlobalInstance.APIInfo.SetTableFatalError(table, err)
+		metrics.AddCounter(metrics.ErrorCounter, 1, table)
+	}
+
+	var wg sync.WaitGroup
+	for _, table := range tables {
+		tableURIs, err := genTableScopedReplicationURIs(storageURI, table)
+		if err != nil {
+			return errors.Trace(err)
+		}
+		wg.Add(1)
+		go func(table string, tableURIs *tableScopedReplicationURIs) {
+			defer wg.Done()
+			if mode != RunModeIncrementalOnly {
+				storage, err := putil.GetExternalStorageFromURI(ctx, tableURIs.storageURI.String())
+				if err != nil {
+					onError(table, err)
+					return
+				}
+				loaded, err := isSnapshotLoaded(ctx, storage, table)
+				if err != nil {
+					onError(table, err)
+					return
+				}
+				if !loaded {
+					apiservice.GlobalInstance.APIInfo.SetTableStage(table, apiservice.TableStageLoadingSnapshot)
+					if err := replicate.StartReplicateSnapshot(ctx, snapConnectorMap[table], table, tidbConfig, tableURIs.snapshotURI, parrallelLoad); err != nil {
+						onError(table, err)
+						return
+					}
+				}
+			}
+			if mode != RunModeSnapshotOnly {
+				apiservice.GlobalInstance.APIInfo.SetTableStage(table, apiservice.TableStageLoadingIncremental)
+				if err := replicate.StartReplicateIncrement(ctx, increConnectorMap[table], table, tableURIs.incrementURI, cdcFlushInterval/5); err != nil {
+					onError(table, err)
+					return
+				}
+			}
+			apiservice.GlobalInstance.APIInfo.SetTableStage(table, apiservice.TableStageFinished)
+		}(table, tableURIs)
 	}
 
 	wg.Wait()
