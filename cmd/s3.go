@@ -32,6 +32,9 @@ func NewS3Cmd() *cobra.Command {
 		csvOutputDialect    string
 		credValue           *credentials.Value
 		mode                RunMode
+		sysbenchDatabase    string
+		sysbenchTablePrefix string
+		sysbenchTableCount  int
 	)
 
 	run := func() error {
@@ -65,6 +68,18 @@ func NewS3Cmd() *cobra.Command {
 			return errors.Trace(err)
 		}
 
+		if sysbenchTableCount > 0 {
+			if len(tables) > 0 {
+				return errors.New("use either --table or --sysbench.tables, not both")
+			}
+			tables, err = buildSysbenchTables(sysbenchDatabase, sysbenchTablePrefix, sysbenchTableCount)
+			if err != nil {
+				return errors.Trace(err)
+			}
+			return ExportTablesSeparately(context.Background(), &tidbConfigFromCli, tables, storageURI,
+				snapshotConcurrency, cdcHost, cdcPort, cdcFlushInterval, cdcFileSize, csvOutputDialect, mode)
+		}
+
 		return Export(context.Background(), &tidbConfigFromCli, tables, storageURI, snapshotURI,
 			incrementURI, snapshotConcurrency, cdcHost, cdcPort, cdcFlushInterval, cdcFileSize, csvOutputDialect, mode)
 	}
@@ -74,7 +89,7 @@ func NewS3Cmd() *cobra.Command {
 		Short: "Export snapshot and incremental data from TiDB to S3",
 		Run: func(_ *cobra.Command, _ []string) {
 			if err := run(); err != nil {
-				log.Error("Fatal error running gcs exporter", zap.Error(err))
+				log.Error("Fatal error running s3 exporter", zap.Error(err))
 			}
 		},
 	}
@@ -87,6 +102,9 @@ func NewS3Cmd() *cobra.Command {
 	cmd.Flags().StringVarP(&tidbConfigFromCli.Pass, "tidb.pass", "p", "", "TiDB password")
 	cmd.Flags().StringVar(&tidbConfigFromCli.SSLCA, "tidb.ssl-ca", "", "TiDB SSL CA")
 	cmd.Flags().StringArrayVarP(&tables, "table", "t", []string{}, "tables full qualified name, e.g. -t <db1>.<table1> -t <db2>.<table2>")
+	cmd.Flags().StringVar(&sysbenchDatabase, "sysbench.database", "", "sysbench database name, e.g. sbtest from --mysql-db=sbtest")
+	cmd.Flags().StringVar(&sysbenchTablePrefix, "sysbench.table-prefix", "sbtest", "sysbench table prefix")
+	cmd.Flags().IntVar(&sysbenchTableCount, "sysbench.tables", 0, "number of sysbench tables; generates <database>.<prefix>1 through <database>.<prefix>N")
 	cmd.Flags().IntVar(&snapshotConcurrency, "snapshot-concurrency", 8, "the number of concurrent snapshot workers")
 	cmd.Flags().StringVarP(&storagePath, "storage", "s", "", "storage path: s3://<bucket>/<path> or gcs://<bucket>/<path>")
 	cmd.Flags().StringVar(&csvOutputDialect, "csv-output-dialect", "", "csv output dialect: default, redshift, snowflake, bigquery")

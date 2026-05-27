@@ -175,17 +175,80 @@ func Export(
 	csvOutputDialect string,
 	mode RunMode,
 ) error {
-	storage, err := putil.GetExternalStorageFromURI(ctx, storageURI.String())
+	startTSO, err := getExportStartTSO(tidbConfig, mode)
 	if err != nil {
 		return errors.Trace(err)
 	}
 
-	startTSO := uint64(0)
-	if mode == RunModeFull {
-		startTSO, err = tidbsql.GetCurrentTSO(tidbConfig)
+	return exportToStorage(ctx, tidbConfig, tables, storageURI, snapshotURI, incrementURI, snapshotConcurrency,
+		cdcHost, cdcPort, cdcFlushInterval, cdcFileSize, csvOutputDialect, mode, startTSO)
+}
+
+func ExportTablesSeparately(
+	ctx context.Context,
+	tidbConfig *tidbsql.TiDBConfig,
+	tables []string,
+	storageURI *url.URL,
+	snapshotConcurrency int,
+	cdcHost string,
+	cdcPort int,
+	cdcFlushInterval time.Duration,
+	cdcFileSize int,
+	csvOutputDialect string,
+	mode RunMode,
+) error {
+	startTSO, err := getExportStartTSO(tidbConfig, mode)
+	if err != nil {
+		return errors.Trace(err)
+	}
+
+	for _, table := range tables {
+		tableStorageURI, err := genTableScopedStorageURI(storageURI, table)
 		if err != nil {
-			return errors.Annotate(err, "Failed to get current TSO")
+			return errors.Trace(err)
 		}
+		snapshotURI, incrementURI, err := genSnapshotAndIncrementURIs(tableStorageURI)
+		if err != nil {
+			return errors.Trace(err)
+		}
+		if err := exportToStorage(ctx, tidbConfig, []string{table}, tableStorageURI, snapshotURI, incrementURI,
+			snapshotConcurrency, cdcHost, cdcPort, cdcFlushInterval, cdcFileSize, csvOutputDialect, mode, startTSO); err != nil {
+			return errors.Trace(err)
+		}
+	}
+	return nil
+}
+
+func getExportStartTSO(tidbConfig *tidbsql.TiDBConfig, mode RunMode) (uint64, error) {
+	if mode != RunModeFull {
+		return 0, nil
+	}
+	startTSO, err := tidbsql.GetCurrentTSO(tidbConfig)
+	if err != nil {
+		return 0, errors.Annotate(err, "Failed to get current TSO")
+	}
+	return startTSO, nil
+}
+
+func exportToStorage(
+	ctx context.Context,
+	tidbConfig *tidbsql.TiDBConfig,
+	tables []string,
+	storageURI *url.URL,
+	snapshotURI *url.URL,
+	incrementURI *url.URL,
+	snapshotConcurrency int,
+	cdcHost string,
+	cdcPort int,
+	cdcFlushInterval time.Duration,
+	cdcFileSize int,
+	csvOutputDialect string,
+	mode RunMode,
+	startTSO uint64,
+) error {
+	storage, err := putil.GetExternalStorageFromURI(ctx, storageURI.String())
+	if err != nil {
+		return errors.Trace(err)
 	}
 
 	if mode != RunModeSnapshotOnly && mode != RunModeCloud {
