@@ -191,6 +191,7 @@ func ExportTablesSeparately(
 	storageURI *url.URL,
 	snapshotConcurrency int,
 	tableConcurrency int,
+	snapshotTableConcurrency int,
 	cdcHost string,
 	cdcPort int,
 	cdcFlushInterval time.Duration,
@@ -203,14 +204,33 @@ func ExportTablesSeparately(
 		return errors.Trace(err)
 	}
 
-	return runTableWorkers(tables, tableConcurrency, func(table string) error {
-		tableURIs, err := genTableScopedReplicationURIs(storageURI, table)
-		if err != nil {
+	if mode != RunModeSnapshotOnly && mode != RunModeCloud {
+		if err := runTableWorkers(tables, tableConcurrency, func(table string) error {
+			tableURIs, err := genTableScopedReplicationURIs(storageURI, table)
+			if err != nil {
+				return errors.Trace(err)
+			}
+			return ensureChangefeed(ctx, []string{table}, tableURIs.storageURI, tableURIs.incrementURI,
+				cdcHost, cdcPort, cdcFlushInterval, cdcFileSize, CdcCsvBinaryEncodingMethodMap[csvOutputDialect], startTSO)
+		}); err != nil {
 			return errors.Trace(err)
 		}
-		return exportToStorage(ctx, tidbConfig, []string{table}, tableURIs.storageURI, tableURIs.snapshotURI, tableURIs.incrementURI,
-			snapshotConcurrency, cdcHost, cdcPort, cdcFlushInterval, cdcFileSize, csvOutputDialect, mode, startTSO)
-	})
+	}
+
+	if mode != RunModeIncrementalOnly && mode != RunModeCloud {
+		if err := runTableWorkers(tables, snapshotTableConcurrency, func(table string) error {
+			tableURIs, err := genTableScopedReplicationURIs(storageURI, table)
+			if err != nil {
+				return errors.Trace(err)
+			}
+			return dumpSnapshot(ctx, tidbConfig, []string{table}, tableURIs.storageURI, tableURIs.snapshotURI,
+				snapshotConcurrency, csvOutputDialect, startTSO)
+		}); err != nil {
+			return errors.Trace(err)
+		}
+	}
+
+	return nil
 }
 
 func getExportStartTSO(tidbConfig *tidbsql.TiDBConfig, mode RunMode) (uint64, error) {
@@ -240,48 +260,81 @@ func exportToStorage(
 	mode RunMode,
 	startTSO uint64,
 ) error {
-	storage, err := putil.GetExternalStorageFromURI(ctx, storageURI.String())
-	if err != nil {
-		return errors.Trace(err)
-	}
-
 	if mode != RunModeSnapshotOnly && mode != RunModeCloud {
-		created, err := isChangeFeedCreated(ctx, storage)
-		if err != nil {
+		if err := ensureChangefeed(ctx, tables, storageURI, incrementURI, cdcHost, cdcPort, cdcFlushInterval, cdcFileSize,
+			CdcCsvBinaryEncodingMethodMap[csvOutputDialect], startTSO); err != nil {
 			return errors.Trace(err)
-		}
-		if !created {
-			cdcConnector, err := cdc.NewCDCConnector(
-				cdcHost, cdcPort, tables, startTSO, incrementURI, cdcFlushInterval, cdcFileSize,
-				CdcCsvBinaryEncodingMethodMap[csvOutputDialect],
-			)
-			if err != nil {
-				return errors.Trace(err)
-			}
-			if err = cdcConnector.CreateChangefeed(); err != nil {
-				return errors.Trace(err)
-			}
 		}
 	}
 
 	if mode != RunModeIncrementalOnly && mode != RunModeCloud {
-		created, err := isDumplingWalkerCreated(ctx, storage)
-		if err != nil {
+		if err := dumpSnapshot(ctx, tidbConfig, tables, storageURI, snapshotURI, snapshotConcurrency, csvOutputDialect, startTSO); err != nil {
 			return errors.Trace(err)
-		}
-		if !created {
-			onSnapshotDumpProgress := func(dumpedRows, totalRows int64) {
-				log.Info("Snapshot dump progress", zap.Int64("dumpedRows", dumpedRows), zap.Int64("estimatedTotalRows", totalRows))
-			}
-			if err := dumpling.RunDump(
-				tidbConfig, snapshotConcurrency, snapshotURI, fmt.Sprint(startTSO), tables,
-				DumplingCsvOutputDialectMap[csvOutputDialect], onSnapshotDumpProgress,
-			); err != nil {
-				return errors.Trace(err)
-			}
 		}
 	}
 	return nil
+}
+
+func ensureChangefeed(
+	ctx context.Context,
+	tables []string,
+	storageURI *url.URL,
+	incrementURI *url.URL,
+	cdcHost string,
+	cdcPort int,
+	cdcFlushInterval time.Duration,
+	cdcFileSize int,
+	binaryEncodingMethod string,
+	startTSO uint64,
+) error {
+	storage, err := putil.GetExternalStorageFromURI(ctx, storageURI.String())
+	if err != nil {
+		return errors.Trace(err)
+	}
+	created, err := isChangeFeedCreated(ctx, storage)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	if created {
+		return nil
+	}
+	cdcConnector, err := cdc.NewCDCConnector(
+		cdcHost, cdcPort, tables, startTSO, incrementURI, cdcFlushInterval, cdcFileSize, binaryEncodingMethod,
+	)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	return cdcConnector.CreateChangefeed()
+}
+
+func dumpSnapshot(
+	ctx context.Context,
+	tidbConfig *tidbsql.TiDBConfig,
+	tables []string,
+	storageURI *url.URL,
+	snapshotURI *url.URL,
+	snapshotConcurrency int,
+	csvOutputDialect string,
+	startTSO uint64,
+) error {
+	storage, err := putil.GetExternalStorageFromURI(ctx, storageURI.String())
+	if err != nil {
+		return errors.Trace(err)
+	}
+	created, err := isDumplingWalkerCreated(ctx, storage)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	if created {
+		return nil
+	}
+	onSnapshotDumpProgress := func(dumpedRows, totalRows int64) {
+		log.Info("Snapshot dump progress", zap.Int64("dumpedRows", dumpedRows), zap.Int64("estimatedTotalRows", totalRows))
+	}
+	return dumpling.RunDump(
+		tidbConfig, snapshotConcurrency, snapshotURI, fmt.Sprint(startTSO), tables,
+		DumplingCsvOutputDialectMap[csvOutputDialect], onSnapshotDumpProgress,
+	)
 }
 
 func Replicate(
@@ -357,6 +410,7 @@ func ReplicateTablesSeparately(
 	storageURI *url.URL,
 	snapshotConcurrency int,
 	tableConcurrency int,
+	snapshotTableConcurrency int,
 	cdcHost string,
 	cdcPort int,
 	cdcFlushInterval time.Duration,
@@ -369,7 +423,7 @@ func ReplicateTablesSeparately(
 ) error {
 	ctx := context.Background()
 	metrics.TableNumGauge.Add(float64(len(tables)))
-	if err := ExportTablesSeparately(ctx, tidbConfig, tables, storageURI, snapshotConcurrency, tableConcurrency,
+	if err := ExportTablesSeparately(ctx, tidbConfig, tables, storageURI, snapshotConcurrency, tableConcurrency, snapshotTableConcurrency,
 		cdcHost, cdcPort, cdcFlushInterval, cdcFileSize, csvOutputDialect, mode); err != nil {
 		return errors.Trace(err)
 	}

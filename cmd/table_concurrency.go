@@ -7,6 +7,7 @@ import (
 )
 
 const DefaultTableConcurrency = 32
+const DefaultSnapshotTableConcurrency = 4
 
 func runTableWorkers(tables []string, concurrency int, fn func(table string) error) error {
 	if concurrency <= 0 {

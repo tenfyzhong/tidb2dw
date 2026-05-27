@@ -22,22 +22,23 @@ import (
 
 func NewSnowflakeCmd() *cobra.Command {
 	var (
-		tidbConfigFromCli      tidbsql.TiDBConfig
-		snowflakeConfigFromCli snowsql.SnowflakeConfig
-		tables                 []string
-		snapshotConcurrency    int
-		tableConcurrency       int
-		storagePath            string
-		cdcHost                string
-		cdcPort                int
-		cdcFlushInterval       time.Duration
-		cdcFileSize            int
-		timezone               string
-		logFile                string
-		logLevel               string
-		awsAccessKey           string
-		awsSecretKey           string
-		credValue              *credentials.Value
+		tidbConfigFromCli        tidbsql.TiDBConfig
+		snowflakeConfigFromCli   snowsql.SnowflakeConfig
+		tables                   []string
+		snapshotConcurrency      int
+		tableConcurrency         int
+		snapshotTableConcurrency int
+		storagePath              string
+		cdcHost                  string
+		cdcPort                  int
+		cdcFlushInterval         time.Duration
+		cdcFileSize              int
+		timezone                 string
+		logFile                  string
+		logLevel                 string
+		awsAccessKey             string
+		awsSecretKey             string
+		credValue                *credentials.Value
 
 		mode                RunMode
 		apiListenHost       string
@@ -94,7 +95,7 @@ func NewSnowflakeCmd() *cobra.Command {
 
 		if useTableScopedStorage {
 			if err := ExportTablesSeparately(context.Background(), &tidbConfigFromCli, tables, storageURI,
-				snapshotConcurrency, tableConcurrency, cdcHost, cdcPort, cdcFlushInterval, cdcFileSize, "snowflake", mode); err != nil {
+				snapshotConcurrency, tableConcurrency, snapshotTableConcurrency, cdcHost, cdcPort, cdcFlushInterval, cdcFileSize, "snowflake", mode); err != nil {
 				return errors.Trace(err)
 			}
 		}
@@ -204,6 +205,7 @@ func NewSnowflakeCmd() *cobra.Command {
 	cmd.Flags().IntVar(&sysbenchTableCount, "sysbench.tables", 0, "number of sysbench tables; generates <database>.<prefix>1 through <database>.<prefix>N")
 	cmd.Flags().IntVar(&snapshotConcurrency, "snapshot-concurrency", 8, "the number of concurrent snapshot workers")
 	cmd.Flags().IntVar(&tableConcurrency, "table-concurrency", DefaultTableConcurrency, "the number of concurrent table workers")
+	cmd.Flags().IntVar(&snapshotTableConcurrency, "snapshot-table-concurrency", DefaultSnapshotTableConcurrency, "the number of concurrent snapshot table workers")
 	cmd.Flags().StringVarP(&storagePath, "storage", "s", "", "storage path: s3://<bucket>/<path> or gcs://<bucket>/<path>")
 	cmd.Flags().StringVar(&cdcHost, "cdc.host", "127.0.0.1", "TiCDC server host")
 	cmd.Flags().IntVar(&cdcPort, "cdc.port", 8300, "TiCDC server port")
